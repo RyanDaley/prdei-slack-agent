@@ -1,0 +1,16 @@
+.gcloudignore
+.git
+.gitignore
+
+# Ignore local virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Ignore Python cache artifacts
+**/__pycache__/
+*.pyc
+
+#ignore environement variables
+env.yaml

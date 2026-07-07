@@ -15,6 +15,12 @@ PROJECT_JOURNAL_MAP = {
     "8494_speckled": "https://docs.google.com/document/d/1EXn98v0Cem_9U9Jq6iFULPBtokFPBADFgZOkv9aUg5A/edit?tab=t.0"
 }
 
+PROJECT_DISPLAY_NAMES = {
+    "tahoe_backyard": "Tahoe Backyard",
+    "wood_energy_facility": "Wood Energy Facility",
+    "8494_speckled": "8494 Speckled Ave",
+}
+
 def extract_id_from_url(input_string: str) -> str:
     """
     Helper function using regular expressions to safely pull the 
@@ -43,6 +49,14 @@ def get_journal_id_for_project(project_value: str) -> str or None:
         
     doc_id = extract_id_from_url(raw_reference)
     return doc_id
+
+
+def get_project_display_name(project_value: str) -> str:
+    return PROJECT_DISPLAY_NAMES.get(
+        project_value,
+        project_value.replace("_", " ").title(),
+    )
+
 
 if __name__ == "__main__":
     # Quick visual terminal test
