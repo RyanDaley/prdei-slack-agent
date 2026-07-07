@@ -21,9 +21,6 @@ GEMINI_MODEL = "gemini-2.5-flash"
 # Document API Scope (Read & Write permissions)
 SCOPES = ['https://www.googleapis.com/auth/documents']
 
-# Force Vertex AI client to use correct quota billing project
-os.environ["GOOGLE_CLOUD_QUOTA_PROJECT"] = PROJECT_ID
-
 
 def get_docs_service():
     """
@@ -32,10 +29,10 @@ def get_docs_service():
     and autonomously in Cloud Run without requiring raw JSON key files.
     """
     try:
+        # Cloud Run service accounts should call Docs API without a forced quota
+        # project; with_quota_project triggers serviceusage checks that fail on
+        # the default compute service account even when IAM is correct.
         credentials, _ = google.auth.default(scopes=SCOPES)
-        # Ensure credentials have access to quota project
-        if hasattr(credentials, "with_quota_project"):
-            credentials = credentials.with_quota_project(PROJECT_ID)
         return build('docs', 'v1', credentials=credentials)
     except Exception as e:
         print(f"[AUTH ERROR] Failed to obtain Application Default Credentials: {e}")
@@ -50,7 +47,8 @@ def format_entry_with_ai(user_name: str, task_category: str, raw_details: str) -
     """
     # Fallback to plain formatting if API client fails to initialize
     try:
-        # Initialize Vertex-based GenAI client using our project settings
+        # Vertex AI billing/quota is tied to the GCP project, not the Docs client.
+        os.environ["GOOGLE_CLOUD_QUOTA_PROJECT"] = PROJECT_ID
         ai_client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
         
         system_instruction = """
