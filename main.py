@@ -49,7 +49,10 @@ def _state_value(state: dict | None, block_id: str, action_id: str, field: str =
     if field == "value":
         return block.get("value")
     if field == "selected_option":
-        return block.get("selected_option", {}).get("value")
+        selected = block.get("selected_option")
+        if not selected:
+            return None
+        return selected.get("value")
     return None
 
 
@@ -201,6 +204,45 @@ def _parse_modal_submission(state_values: dict, user_name: str) -> tuple[list[jm
     return entries, errors
 
 
+@app.command("/refreshjournal")
+def handle_refresh_journal(ack, body, client):
+    ack()
+    project_key = (body.get("text") or "").strip()
+    user_id = body.get("user_id")
+
+    if not project_key:
+        client.chat_postEphemeral(
+            channel=body["channel_id"],
+            user=user_id,
+            text=(
+                "Usage: `/refreshjournal <project_key>`\n"
+                "Examples: `tahoe_backyard`, `wood_energy_facility`, `8494_speckled`"
+            ),
+        )
+        return
+
+    doc_id = project_router.get_journal_id_for_project(project_key)
+    project_name = project_router.get_project_display_name(project_key)
+    if not doc_id:
+        client.chat_postEphemeral(
+            channel=body["channel_id"],
+            user=user_id,
+            text=f"No Google Doc mapped for '{project_key}'.",
+        )
+        return
+
+    result = agent_journal.refresh_weekly_summary(doc_id, project_name)
+    if result.summary_updated:
+        text = f"✅ Refreshed weekly summary for *{project_name}*."
+    else:
+        text = f"❌ Could not refresh summary for *{project_name}*: {result.error_message or 'unknown error'}"
+
+    try:
+        client.chat_postEphemeral(channel=body["channel_id"], user=user_id, text=text)
+    except Exception:
+        client.chat_postMessage(channel=user_id, text=text)
+
+
 @app.command("/logtime")
 def handle_logtime_command(ack, body, client):
     ack()
@@ -277,12 +319,15 @@ def handle_logtime_submission(ack, body, client, view):
     metadata = json.loads(view.get("private_metadata") or "{}")
     channel_id = metadata.get("channel_id")
     user_id = user.get("id") or metadata.get("user_id")
-    if channel_id and user_id:
-        client.chat_postEphemeral(
-            channel=channel_id,
-            user=user_id,
-            text="\n".join(results) if results else "No entries were processed.",
-        )
+    message = "\n".join(results) if results else "No entries were processed."
+    if user_id:
+        try:
+            if channel_id:
+                client.chat_postEphemeral(channel=channel_id, user=user_id, text=message)
+            else:
+                client.chat_postMessage(channel=user_id, text=message)
+        except Exception as exc:
+            print(f"[SLACK WARNING] Could not send confirmation message: {exc}")
 
 
 class DummyHealthCheckServer(BaseHTTPRequestHandler):

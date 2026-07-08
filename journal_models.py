@@ -139,6 +139,28 @@ def compute_hours_by_category(entries: list[LogEntry]) -> dict[str, float]:
     return dict(sorted(totals.items()))
 
 
+def build_fallback_summary(entries: list["LogEntry"]) -> dict:
+    """Python-only summary when Gemini is unavailable."""
+    total_hours = round(sum(entry.hours for entry in entries), 2)
+    hours_by_category = compute_hours_by_category(entries)
+
+    lines = []
+    for entry in entries:
+        lines.append(
+            f"- {entry.timestamp_str} ({entry.hours:g} hr, {entry.category_label}): "
+            f"{entry.activity}"
+        )
+    narrative = (
+        "Weekly activity summary compiled from logged entries:\n\n"
+        + "\n".join(lines)
+    )
+    return {
+        "total_hours": total_hours,
+        "hours_by_category": hours_by_category,
+        "accomplishments_narrative": narrative,
+    }
+
+
 def render_summary_body(
     total_hours: float,
     hours_by_category: dict[str, float],

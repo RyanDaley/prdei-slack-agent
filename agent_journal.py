@@ -290,7 +290,8 @@ Return JSON with exactly these fields:
         compiled = json.loads(response.text.strip())
     except Exception as exc:
         print(f"  [AI ERROR] Gemini weekly compilation failed: {exc}")
-        return None
+        print("  [AI FALLBACK] Using Python-generated summary instead.")
+        return jm.build_fallback_summary(entries)
 
     compiled["total_hours"] = total_hours
     compiled["hours_by_category"] = hours_by_category
@@ -299,6 +300,50 @@ Return JSON with exactly these fields:
             "Work was logged this week. See the detailed activity log below."
         )
     return compiled
+
+
+def _update_summary_from_doc(
+    document_id: str,
+    project_name: str,
+    service,
+) -> bool:
+    week_start, week_end, week_label = jm.get_current_week_range()
+    doc_text = read_document_text(document_id, service=service)
+    week_entries = parse_log_entries(doc_text, week_start, week_end)
+    if not week_entries:
+        print("  [JOURNAL WARNING] No entries found for current week.")
+        return False
+
+    compiled = compile_weekly_summary(week_entries, project_name, week_label)
+    if not compiled:
+        return False
+
+    summary_body = jm.render_summary_body(
+        compiled["total_hours"],
+        compiled["hours_by_category"],
+        compiled["accomplishments_narrative"],
+    )
+    return replace_summary_section(document_id, summary_body, service=service)
+
+
+def refresh_weekly_summary(document_id: str, project_name: str) -> JournalUpdateResult:
+    """Recompile and replace the weekly summary from existing log entries."""
+    if not document_id:
+        return JournalUpdateResult(success=False, error_message="Document ID is empty.")
+
+    try:
+        service = get_docs_service()
+        week_start, week_end, week_label = jm.get_current_week_range()
+        initialize_document_structure(document_id, project_name, week_label, service=service)
+        summary_updated = _update_summary_from_doc(document_id, project_name, service)
+        return JournalUpdateResult(
+            success=summary_updated,
+            summary_updated=summary_updated,
+            error_message="" if summary_updated else "Could not refresh weekly summary.",
+        )
+    except Exception as exc:
+        print(f"  [JOURNAL ERROR] Failed to refresh summary: {exc}")
+        return JournalUpdateResult(success=False, error_message=str(exc))
 
 
 def process_journal_update(
@@ -328,22 +373,9 @@ def process_journal_update(
         append_log_entries(document_id, new_entries, service=service)
         log_appended = True
 
-        doc_text = read_document_text(document_id, service=service)
-        week_entries = parse_log_entries(doc_text, week_start, week_end)
-        compiled = compile_weekly_summary(week_entries, project_name, week_label)
-
-        summary_updated = False
-        if compiled:
-            summary_body = jm.render_summary_body(
-                compiled["total_hours"],
-                compiled["hours_by_category"],
-                compiled["accomplishments_narrative"],
-            )
-            summary_updated = replace_summary_section(
-                document_id, summary_body, service=service
-            )
-            if not summary_updated:
-                print("  [JOURNAL WARNING] Log saved but summary section update failed.")
+        summary_updated = _update_summary_from_doc(document_id, project_name, service)
+        if not summary_updated:
+            print("  [JOURNAL WARNING] Log saved but summary section update failed.")
 
         print(
             f"  [JOURNAL SUCCESS] Logged {hours_logged:g} hr(s) to {document_id}; "
