@@ -10,6 +10,7 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 import agent_journal
+import hourly_reminder
 import journal_models as jm
 import project_router
 
@@ -255,6 +256,52 @@ def handle_logtime_command(ack, body, client):
     )
 
 
+@app.command("/myslackid")
+def handle_myslackid_command(ack, body, client):
+    ack()
+    user_id = body.get("user_id", "")
+    client.chat_postEphemeral(
+        channel=body["channel_id"],
+        user=user_id,
+        text=(
+            f"Your Slack user ID is `{user_id}`.\n"
+            "Set `REMINDER_USER_ID` to this value in env.yaml, then redeploy."
+        ),
+    )
+
+
+@app.command("/testreminder")
+def handle_test_reminder_command(ack, body, client):
+    """Send the hourly Block Kit message now."""
+    ack()
+    user_id = body.get("user_id", "")
+    if hourly_reminder.send_hourly_reminder(client, user_id):
+        client.chat_postEphemeral(
+            channel=body["channel_id"],
+            user=user_id,
+            text="Hourly block message sent to your DM. Click *Open Time Entry Form*.",
+        )
+    else:
+        client.chat_postEphemeral(
+            channel=body["channel_id"],
+            user=user_id,
+            text="Failed to send reminder. Check Cloud Run logs.",
+        )
+
+
+@app.action("open_logtime_modal")
+def handle_open_logtime_modal(ack, body, client):
+    ack()
+    trigger_id = body.get("trigger_id")
+    user_id = body.get("user", {}).get("id", "")
+    channel_id = body.get("channel", {}).get("id", user_id)
+    if not trigger_id:
+        print("[SLACK ERROR] Missing trigger_id for open_logtime_modal.")
+        return
+    print(f"[SLACK SOCKET] Opening logtime modal for {user_id}.")
+    _open_logtime_modal(client, trigger_id, channel_id, user_id)
+
+
 @app.action("duration_select")
 def handle_duration_select(ack, body, client):
     ack()
@@ -356,6 +403,7 @@ if __name__ == "__main__":
     if not app_token:
         print("[CRITICAL] SLACK_APP_TOKEN is missing. Outbound socket connection cannot start.")
     else:
+        hourly_reminder.start_hourly_reminder_thread(app.client)
         print("Bolt app is running in Socket Mode! Listening for Slack events...")
         handler = SocketModeHandler(app, app_token)
         handler.start()
