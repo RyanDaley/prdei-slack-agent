@@ -86,9 +86,28 @@ def parse_log_line(line: str) -> Optional[LogEntry]:
         timestamp=timestamp,
         user=user.strip(),
         hours=hours,
-        category=category.strip(),
+        category=normalize_category_key(category),
         activity=activity.strip(),
     )
+
+
+def normalize_category_key(category: str) -> str:
+    """Map stored category keys or display labels onto a canonical key."""
+    raw = (category or "").strip()
+    if not raw:
+        return raw
+    if raw in TASK_CATEGORY_LABELS:
+        return raw
+
+    label_to_key = {label: key for key, label in TASK_CATEGORY_LABELS.items()}
+    if raw in label_to_key:
+        return label_to_key[raw]
+
+    lowered = raw.lower()
+    for key, label in TASK_CATEGORY_LABELS.items():
+        if key.lower() == lowered or label.lower() == lowered:
+            return key
+    return raw
 
 
 def get_current_week_range(
@@ -135,8 +154,41 @@ def compute_hours_by_category(entries: list[LogEntry]) -> dict[str, float]:
     totals: dict[str, float] = {}
     for entry in entries:
         label = entry.category_label
-        totals[label] = totals.get(label, 0.0) + entry.hours
+        totals[label] = round(totals.get(label, 0.0) + entry.hours, 2)
     return dict(sorted(totals.items()))
+
+
+def extract_active_detail_log_text(doc_text: str) -> str:
+    """
+    Return only the active detailed-activity text used for weekly totals.
+
+    Ignores archived legacy body content, while still including:
+    - entries between the detail heading and the legacy heading, and
+    - trailing ENTRY lines appended after the legacy block (older layout).
+    """
+    text = doc_text or ""
+    if DETAIL_LOG_HEADING in text:
+        text = text.split(DETAIL_LOG_HEADING, 1)[1]
+
+    if LEGACY_HEADING not in text:
+        return text
+
+    before_legacy, _, after_legacy = text.partition(LEGACY_HEADING)
+    trailing_entries: list[str] = []
+    for line in reversed(after_legacy.splitlines()):
+        stripped = line.strip()
+        if stripped.startswith("ENTRY|"):
+            trailing_entries.append(stripped)
+        elif not stripped:
+            continue
+        else:
+            break
+    trailing_entries.reverse()
+
+    parts = [before_legacy.strip()]
+    if trailing_entries:
+        parts.append("\n".join(trailing_entries))
+    return "\n".join(part for part in parts if part)
 
 
 def build_fallback_summary(entries: list["LogEntry"]) -> dict:

@@ -102,7 +102,8 @@ def _is_work_time(now: datetime) -> bool:
 
     start_hour = int(os.environ.get("REMINDER_WORK_START", "8"))
     end_hour = int(os.environ.get("REMINDER_WORK_END", "18"))
-    return start_hour <= now.hour < end_hour
+    # Inclusive end hour so REMINDER_WORK_END=18 still sends at 18:00.
+    return start_hour <= now.hour <= end_hour
 
 
 def _seconds_until_next_hour(tz: ZoneInfo) -> float:

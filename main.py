@@ -22,6 +22,12 @@ PROJECT_OPTIONS = [
     {"text": {"type": "plain_text", "text": "8494 Speckled Ave"}, "value": "8494_speckled"},
 ]
 
+BREAK_PROJECT_VALUE = "break"
+BREAK_PROJECT_OPTION = {
+    "text": {"type": "plain_text", "text": "Break"},
+    "value": BREAK_PROJECT_VALUE,
+}
+
 TASK_OPTIONS = [
     {"text": {"type": "plain_text", "text": "CAD / BIM Modeling"}, "value": "cad_modeling"},
     {"text": {"type": "plain_text", "text": "Permitting / Code Review"}, "value": "permitting"},
@@ -33,6 +39,12 @@ DURATION_OPTIONS = [
     {"text": {"type": "plain_text", "text": "0.5 hr (two activities)"}, "value": "0.5"},
     {"text": {"type": "plain_text", "text": "0.25 hr (four activities)"}, "value": "0.25"},
 ]
+
+
+def _project_options(*, allow_break: bool) -> list[dict]:
+    if allow_break:
+        return [*PROJECT_OPTIONS, BREAK_PROJECT_OPTION]
+    return PROJECT_OPTIONS
 
 
 def _open_logtime_modal(client, trigger_id: str, channel_id: str, user_id: str):
@@ -57,16 +69,37 @@ def _state_value(state: dict | None, block_id: str, action_id: str, field: str =
     return None
 
 
-def _entry_row_blocks(row_index: int, duration: str, preserve_state: dict | None = None) -> list[dict]:
-    project_block_id = f"entry_{row_index}_project_block"
-    task_block_id = f"entry_{row_index}_task_block"
+def _entry_block_ids(row_index: int, side_by_side: bool) -> tuple[str, str, str]:
+    """Return (project_block_id, task_block_id, accomplishment_block_id)."""
     accomplishment_block_id = f"entry_{row_index}_accomplishment_block"
+    if side_by_side:
+        # Project + task share one actions block so Slack can render them horizontally.
+        shared = f"entry_{row_index}_fields_block"
+        return shared, shared, accomplishment_block_id
+    return (
+        f"entry_{row_index}_project_block",
+        f"entry_{row_index}_task_block",
+        accomplishment_block_id,
+    )
+
+
+def _entry_row_blocks(
+    row_index: int,
+    duration: str,
+    preserve_state: dict | None = None,
+    *,
+    side_by_side: bool = False,
+) -> list[dict]:
+    project_block_id, task_block_id, accomplishment_block_id = _entry_block_ids(
+        row_index, side_by_side
+    )
+    project_options = _project_options(allow_break=side_by_side)
 
     project_element = {
         "type": "static_select",
         "action_id": "project_select",
         "placeholder": {"type": "plain_text", "text": "Select a Project"},
-        "options": PROJECT_OPTIONS,
+        "options": project_options,
     }
     task_element = {
         "type": "static_select",
@@ -81,14 +114,20 @@ def _entry_row_blocks(row_index: int, duration: str, preserve_state: dict | None
         "placeholder": {"type": "plain_text", "text": "What did you accomplish?"},
     }
 
-    saved_project = _state_value(preserve_state, project_block_id, "project_select", "selected_option")
-    saved_task = _state_value(preserve_state, task_block_id, "task_select", "selected_option")
-    saved_accomplishment = _state_value(preserve_state, accomplishment_block_id, "accomplishment_input")
+    saved_project = _state_value(
+        preserve_state, project_block_id, "project_select", "selected_option"
+    )
+    saved_task = _state_value(
+        preserve_state, task_block_id, "task_select", "selected_option"
+    )
+    saved_accomplishment = _state_value(
+        preserve_state, accomplishment_block_id, "accomplishment_input"
+    )
 
     if saved_project:
-        project_element["initial_option"] = next(
-            opt for opt in PROJECT_OPTIONS if opt["value"] == saved_project
-        )
+        matched = next((opt for opt in project_options if opt["value"] == saved_project), None)
+        if matched:
+            project_element["initial_option"] = matched
     if saved_task:
         task_element["initial_option"] = next(
             opt for opt in TASK_OPTIONS if opt["value"] == saved_task
@@ -97,36 +136,57 @@ def _entry_row_blocks(row_index: int, duration: str, preserve_state: dict | None
         accomplishment_element["initial_value"] = saved_accomplishment
 
     row_label = f"Entry {row_index + 1} ({duration} hr)"
-    return [
+    blocks: list[dict] = [
         {"type": "divider"},
         {
             "type": "section",
             "text": {"type": "mrkdwn", "text": f"*{row_label}*"},
         },
-        {
-            "type": "input",
-            "block_id": project_block_id,
-            "element": project_element,
-            "label": {"type": "plain_text", "text": "Project Name"},
-        },
-        {
-            "type": "input",
-            "block_id": task_block_id,
-            "element": task_element,
-            "label": {"type": "plain_text", "text": "Task Category"},
-        },
+    ]
+
+    if side_by_side:
+        # Slack renders multiple elements in an actions block on one row.
+        blocks.append(
+            {
+                "type": "actions",
+                "block_id": project_block_id,
+                "elements": [project_element, task_element],
+            }
+        )
+    else:
+        blocks.extend(
+            [
+                {
+                    "type": "input",
+                    "block_id": project_block_id,
+                    "element": project_element,
+                    "label": {"type": "plain_text", "text": "Project Name"},
+                },
+                {
+                    "type": "input",
+                    "block_id": task_block_id,
+                    "element": task_element,
+                    "label": {"type": "plain_text", "text": "Task Category"},
+                },
+            ]
+        )
+
+    blocks.append(
         {
             "type": "input",
             "block_id": accomplishment_block_id,
             "element": accomplishment_element,
             "label": {"type": "plain_text", "text": "What did you accomplish?"},
-        },
-    ]
+            "optional": side_by_side,
+        }
+    )
+    return blocks
 
 
 def build_logtime_modal(duration: str = "1.0", preserve_state: dict | None = None) -> dict:
     row_count = jm.DURATION_ROW_COUNTS.get(duration, 1)
     duration_option = next(opt for opt in DURATION_OPTIONS if opt["value"] == duration)
+    side_by_side = row_count > 1
 
     blocks = [
         {
@@ -153,8 +213,32 @@ def build_logtime_modal(duration: str = "1.0", preserve_state: dict | None = Non
         },
     ]
 
+    if side_by_side:
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": (
+                            "Choose *Break* on any unused slice — "
+                            "Break entries are not written to the detailed activity log. "
+                            "Task and accomplishment are optional for Break."
+                        ),
+                    }
+                ],
+            }
+        )
+
     for row_index in range(row_count):
-        blocks.extend(_entry_row_blocks(row_index, duration, preserve_state))
+        blocks.extend(
+            _entry_row_blocks(
+                row_index,
+                duration,
+                preserve_state,
+                side_by_side=side_by_side,
+            )
+        )
 
     return {
         "type": "modal",
@@ -166,43 +250,79 @@ def build_logtime_modal(duration: str = "1.0", preserve_state: dict | None = Non
     }
 
 
-def _parse_modal_submission(state_values: dict, user_name: str) -> tuple[list[jm.LogEntry], dict]:
+def _parse_modal_submission(state_values: dict, user_name: str) -> tuple[list[jm.LogEntry], dict, float]:
+    """
+    Parse modal state into journal entries.
+
+    Returns (work_entries, errors, break_hours). Break rows are validated but not logged.
+    """
     errors = {}
     duration = _state_value(state_values, "duration_block", "duration_select", "selected_option") or "1.0"
     row_count = jm.DURATION_ROW_COUNTS.get(duration, 1)
+    side_by_side = row_count > 1
     hours = float(duration)
     now = datetime.now(ZoneInfo(jm.JOURNAL_TIMEZONE))
     entries = []
+    break_hours = 0.0
 
     for row_index in range(row_count):
-        project_block_id = f"entry_{row_index}_project_block"
-        task_block_id = f"entry_{row_index}_task_block"
-        accomplishment_block_id = f"entry_{row_index}_accomplishment_block"
+        project_block_id, task_block_id, accomplishment_block_id = _entry_block_ids(
+            row_index, side_by_side
+        )
 
         project_key = _state_value(state_values, project_block_id, "project_select", "selected_option")
         task_category = _state_value(state_values, task_block_id, "task_select", "selected_option")
         accomplishment = _state_value(state_values, accomplishment_block_id, "accomplishment_input")
 
         if not project_key:
-            errors[project_block_id] = "Select a project."
-        if not task_category:
-            errors[task_block_id] = "Select a task category."
-        if not accomplishment or not accomplishment.strip():
-            errors[accomplishment_block_id] = "Describe what you accomplished."
+            if side_by_side:
+                errors[accomplishment_block_id] = "Select a project (or Break)."
+            else:
+                errors[project_block_id] = "Select a project."
+            continue
 
-        if project_key and task_category and accomplishment and accomplishment.strip():
-            entries.append(
-                jm.LogEntry(
-                    timestamp=now,
-                    user=user_name,
-                    hours=hours,
-                    category=task_category,
-                    activity=accomplishment.strip(),
-                    project_key=project_key,
+        if project_key == BREAK_PROJECT_VALUE:
+            if not side_by_side:
+                errors[project_block_id] = "Break is only available for split-hour entries."
+                continue
+            break_hours += hours
+            continue
+
+        if side_by_side:
+            missing_fields = []
+            if not task_category:
+                missing_fields.append("task")
+            if not accomplishment or not accomplishment.strip():
+                missing_fields.append("accomplishment")
+            # Slack only accepts view errors on input blocks, not actions blocks.
+            if missing_fields:
+                errors[accomplishment_block_id] = (
+                    f"Complete {' / '.join(missing_fields)} for this entry."
                 )
-            )
+                continue
+        else:
+            if not task_category:
+                errors[task_block_id] = "Select a task category."
+            if not accomplishment or not accomplishment.strip():
+                errors[accomplishment_block_id] = "Describe what you accomplished."
+            if task_block_id in errors or accomplishment_block_id in errors:
+                continue
 
-    return entries, errors
+        if not task_category or not accomplishment or not accomplishment.strip():
+            continue
+
+        entries.append(
+            jm.LogEntry(
+                timestamp=now,
+                user=user_name,
+                hours=hours,
+                category=task_category,
+                activity=accomplishment.strip(),
+                project_key=project_key,
+            )
+        )
+
+    return entries, errors, break_hours
 
 
 @app.command("/refreshjournal")
@@ -222,19 +342,29 @@ def handle_refresh_journal(ack, body, client):
         )
         return
 
-    doc_id = project_router.get_journal_id_for_project(project_key)
+    assets = project_router.ensure_project_assets(project_key)
     project_name = project_router.get_project_display_name(project_key)
-    if not doc_id:
+    if not assets:
         client.chat_postEphemeral(
             channel=body["channel_id"],
             user=user_id,
-            text=f"No Google Doc mapped for '{project_key}'.",
+            text=(
+                f"No Drive folder mapped for `{project_key}`. "
+                "Set PROJECT_DOC_MAP to that project's Google Drive folder URL."
+            ),
         )
         return
 
-    result = agent_journal.refresh_weekly_summary(doc_id, project_name)
+    result = agent_journal.refresh_weekly_summary(
+        assets.document_id,
+        project_name,
+        project_key=project_key,
+        spreadsheet_id=assets.spreadsheet_id,
+    )
     if result.summary_updated:
-        text = f"✅ Refreshed weekly summary for *{project_name}*."
+        refresh_note = " Doc tables refreshed." if result.docs_refreshed else ""
+        sheet_note = f" Sheet `{result.spreadsheet_id}`." if result.spreadsheet_id else ""
+        text = f"✅ Refreshed weekly summary for *{project_name}*.{sheet_note}{refresh_note}"
     else:
         text = f"❌ Could not refresh summary for *{project_name}*: {result.error_message or 'unknown error'}"
 
@@ -302,6 +432,18 @@ def handle_open_logtime_modal(ack, body, client):
     _open_logtime_modal(client, trigger_id, channel_id, user_id)
 
 
+@app.action("project_select")
+def handle_project_select(ack):
+    """No-op: actions-block selects must be acked to avoid Unhandled request."""
+    ack()
+
+
+@app.action("task_select")
+def handle_task_select(ack):
+    """No-op: actions-block selects must be acked to avoid Unhandled request."""
+    ack()
+
+
 @app.action("duration_select")
 def handle_duration_select(ack, body, client):
     ack()
@@ -324,7 +466,7 @@ def handle_logtime_submission(ack, body, client, view):
     user_name = user.get("name") or user.get("username", "Unknown User")
     state_values = view.get("state", {}).get("values", {})
 
-    entries, errors = _parse_modal_submission(state_values, user_name)
+    entries, errors, break_hours = _parse_modal_submission(state_values, user_name)
     if errors:
         ack(response_action="errors", errors=errors)
         return
@@ -336,32 +478,61 @@ def handle_logtime_submission(ack, body, client, view):
         entries_by_project[entry.project_key].append(entry)
 
     total_hours = round(sum(entry.hours for entry in entries), 2)
-    print(f"[SLACK SOCKET] Modal submitted by {user_name}: {len(entries)} entries, {total_hours} hr")
+    print(
+        f"[SLACK SOCKET] Modal submitted by {user_name}: "
+        f"{len(entries)} journal entries ({total_hours:g} hr), "
+        f"break={break_hours:g} hr"
+    )
 
     results = []
     for project_key, project_entries in entries_by_project.items():
-        doc_id = project_router.get_journal_id_for_project(project_key)
         project_name = project_router.get_project_display_name(project_key)
-        if not doc_id:
+        try:
+            assets = project_router.ensure_project_assets(project_key)
+        except Exception as exc:
             results.append(
-                f"⚠️ No Google Doc mapped for '{project_router.get_project_display_name(project_key)}'."
+                f"❌ *{project_name}* (`{project_key}`): Drive setup failed — {exc}"
+            )
+            continue
+        if not assets:
+            results.append(
+                f"⚠️ No Drive folder mapped for key `{project_key}` "
+                f"(display '{project_name}'). "
+                f"Set `PROJECT_FOLDER_{project_key.upper()}` in env.yaml or "
+                "PROJECT_DOC_MAP, then redeploy."
             )
             continue
 
-        result = agent_journal.process_journal_update(doc_id, project_name, project_entries)
+        result = agent_journal.process_journal_update(
+            assets.document_id,
+            project_name,
+            project_entries,
+            project_key=project_key,
+            spreadsheet_id=assets.spreadsheet_id,
+        )
         project_hours = round(sum(entry.hours for entry in project_entries), 2)
         if result.log_appended and result.summary_updated:
+            refresh_note = " Doc tables synced." if result.docs_refreshed else ""
             results.append(
-                f"✅ *{project_name}*: logged {project_hours:g} hr(s) and refreshed weekly summary."
+                f"✅ *{project_name}* (Doc `{assets.document_title}`): "
+                f"logged {project_hours:g} hr(s) to Sheet "
+                f"and refreshed weekly narrative.{refresh_note}"
             )
         elif result.log_appended:
             results.append(
-                f"⚠️ *{project_name}*: logged {project_hours:g} hr(s), but weekly summary refresh failed."
+                f"⚠️ *{project_name}*: logged {project_hours:g} hr(s) to Sheet, "
+                "but Doc narrative refresh failed."
             )
         else:
             results.append(
-                f"❌ *{project_name}*: could not write to Google Doc ({result.error_message or 'unknown error'})."
+                f"❌ *{project_name}*: could not write journal "
+                f"({result.error_message or 'unknown error'})."
             )
+
+    if break_hours:
+        results.append(
+            f"☕ Break: {break_hours:g} hr skipped (not written to the detailed activity log)."
+        )
 
     metadata = json.loads(view.get("private_metadata") or "{}")
     channel_id = metadata.get("channel_id")
