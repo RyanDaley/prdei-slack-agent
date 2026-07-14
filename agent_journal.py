@@ -3,14 +3,16 @@ AEC Agent Journal Integration.
 
 Architecture:
   - Google Sheets = source of truth for Detailed Activity Log, Total Hours,
-    and Hours by Category (Dashboard formulas).
-  - Google Docs = client narrative (Gemini) plus tables rebuilt from Sheets
-    by Apps Script (native Docs "Update all" on linked charts is not exposed
-    to Apps Script / Docs API).
+    Actual Hours by Category (formulas), and Estimate hours (manual).
+    Dashboard includes an Actual vs Estimate bar chart.
+  - Google Docs = client narrative (Gemini) plus Hours/Activity text synced
+    from Sheets, with the category bar chart re-embedded as an image on each
+    Activity Log update (Docs API cannot refresh native linked charts).
 """
 
 from __future__ import annotations
 
+import io
 import json
 import os
 from dataclasses import dataclass
@@ -21,6 +23,7 @@ from google import genai
 from google.genai import types as genai_types
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseUpload
 
 import agent_sheets
 import journal_models as jm
@@ -37,6 +40,8 @@ SCOPES = [
 
 HOURS_START = "--- HOURS SUMMARY (FROM SHEETS) ---"
 HOURS_END = "--- END HOURS SUMMARY ---"
+CHART_START = "--- CATEGORY CHART (FROM SHEETS) ---"
+CHART_END = "--- END CATEGORY CHART ---"
 ACTIVITY_START = "--- DETAILED ACTIVITY LOG ---"
 ACTIVITY_END = "--- END DETAILED ACTIVITY LOG ---"
 
@@ -117,14 +122,14 @@ def _build_doc_header(project_name: str, week_label: str) -> str:
         f"{jm.SUMMARY_HEADING}\n"
         "(Accomplishments narrative will appear after your first entry this week.)\n\n"
         f"{HOURS_START}\n"
-        "(Hours tables sync from the Google Sheet — insert a linked chart/table from "
-        f"the '{agent_sheets.spreadsheet_title_for_project(project_name)}' Dashboard "
-        "tab for live visuals, or rely on the Apps Script sync below.)\n"
+        "(Hours summary syncs from the Google Sheet Dashboard after each log entry.)\n"
         f"{HOURS_END}\n\n"
+        f"{CHART_START}\n"
+        "(Actual vs Estimate chart syncs from the Sheet Dashboard.)\n"
+        f"{CHART_END}\n\n"
         f"{ACTIVITY_START}\n"
-        "(Detailed Activity Log lives in Google Sheets. Linked tables/charts from the "
-        "ActivityLog tab can be pasted here; Apps Script rebuilds the synced table "
-        "after each Slack submission.)\n"
+        "(Detailed Activity Log lives in Google Sheets and syncs here after each "
+        "Slack submission.)\n"
         f"{ACTIVITY_END}\n"
     )
 
@@ -144,13 +149,15 @@ def initialize_document_structure(
         return False
 
     existing_text = read_document_text(document_id, service=service)
-    has_markers = (
+    has_core_markers = (
         jm.SUMMARY_HEADING in existing_text
         and HOURS_START in existing_text
         and ACTIVITY_START in existing_text
     )
-    if has_markers:
+    if has_core_markers and CHART_START in existing_text:
         return True
+    if has_core_markers and CHART_START not in existing_text:
+        return _ensure_chart_markers(document_id, service=service)
 
     end_index = body_content[-1].get("endIndex", 1) - 1
     replacement = _build_doc_header(project_name, week_label)
@@ -181,6 +188,39 @@ def initialize_document_structure(
     return True
 
 
+def _ensure_chart_markers(document_id: str, service=None) -> bool:
+    """Insert chart section markers after Hours if an older Doc lacks them."""
+    service = service or get_docs_service()
+    document = get_document(service, document_id)
+    body_content = _collect_body_elements(document)
+    hours_end = _find_marker_indices(body_content, HOURS_END)
+    activity_start = _find_marker_indices(body_content, ACTIVITY_START)
+    if not hours_end or not activity_start:
+        print("[JOURNAL WARNING] Could not insert chart markers — hours/activity missing.")
+        return False
+    _, hours_end_idx = hours_end
+    insert_text = (
+        f"\n{CHART_START}\n"
+        "(Actual vs Estimate chart syncs from the Sheet Dashboard.)\n"
+        f"{CHART_END}\n"
+    )
+    service.documents().batchUpdate(
+        documentId=document_id,
+        body={
+            "requests": [
+                {
+                    "insertText": {
+                        "location": {"index": hours_end_idx},
+                        "text": insert_text,
+                    }
+                }
+            ]
+        },
+    ).execute()
+    print("  [JOURNAL] Inserted category chart markers into document.")
+    return True
+
+
 def replace_summary_section(
     document_id: str,
     summary_body: str,
@@ -198,28 +238,321 @@ def replace_summary_section(
 
     _, summary_end = summary_range
     hours_start, _ = hours_range
-    if summary_end >= hours_start:
+    if summary_end > hours_start:
         print("[JOURNAL ERROR] Invalid summary section range.")
         return False
 
-    requests = [
-        {
-            "deleteContentRange": {
-                "range": {"startIndex": summary_end, "endIndex": hours_start}
+    requests = []
+    if summary_end < hours_start:
+        requests.append(
+            {
+                "deleteContentRange": {
+                    "range": {"startIndex": summary_end, "endIndex": hours_start}
+                }
             }
-        },
+        )
+    requests.append(
         {
             "insertText": {
                 "location": {"index": summary_end},
                 "text": f"\n{summary_body}\n",
             }
-        },
-    ]
+        }
+    )
     service.documents().batchUpdate(
         documentId=document_id,
         body={"requests": requests},
     ).execute()
     return True
+
+
+def replace_between_markers(
+    document_id: str,
+    start_marker: str,
+    end_marker: str,
+    body_text: str,
+    service=None,
+) -> bool:
+    """Replace everything between two marker paragraphs (markers kept)."""
+    service = service or get_docs_service()
+    document = get_document(service, document_id)
+    body_content = _collect_body_elements(document)
+
+    start_range = _find_marker_indices(body_content, start_marker)
+    end_range = _find_marker_indices(body_content, end_marker)
+    if not start_range or not end_range:
+        print(
+            f"[JOURNAL ERROR] Missing markers for section sync: "
+            f"{start_marker!r} / {end_marker!r}"
+        )
+        return False
+
+    _, start_end = start_range
+    end_start, _ = end_range
+    if start_end > end_start:
+        print(f"[JOURNAL ERROR] Invalid marker range for {start_marker!r}.")
+        return False
+
+    text = body_text if body_text.endswith("\n") else body_text + "\n"
+    requests = []
+    if start_end < end_start:
+        requests.append(
+            {
+                "deleteContentRange": {
+                    "range": {"startIndex": start_end, "endIndex": end_start}
+                }
+            }
+        )
+    requests.append(
+        {
+            "insertText": {
+                "location": {"index": start_end},
+                "text": f"\n{text}",
+            }
+        }
+    )
+    service.documents().batchUpdate(
+        documentId=document_id,
+        body={"requests": requests},
+    ).execute()
+    return True
+
+
+def _get_drive_service():
+    credentials, _ = google.auth.default(scopes=SCOPES)
+    return build("drive", "v3", credentials=credentials)
+
+
+def _folder_id_for_spreadsheet(spreadsheet_id: str) -> str:
+    drive = _get_drive_service()
+    meta = (
+        drive.files()
+        .get(
+            fileId=spreadsheet_id,
+            fields="parents",
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
+    parents = meta.get("parents") or []
+    return parents[0] if parents else ""
+
+
+def _upload_temp_public_png(
+    png_bytes: bytes,
+    filename: str,
+    folder_id: str = "",
+) -> tuple[str, str]:
+    """Upload PNG to Drive with anyone-with-link read; return (file_id, public_uri)."""
+    drive = _get_drive_service()
+    media = MediaIoBaseUpload(io.BytesIO(png_bytes), mimetype="image/png", resumable=False)
+    body: dict = {"name": filename, "mimeType": "image/png"}
+    if folder_id:
+        body["parents"] = [folder_id]
+    created = (
+        drive.files()
+        .create(
+            body=body,
+            media_body=media,
+            fields="id",
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
+    file_id = created["id"]
+    drive.permissions().create(
+        fileId=file_id,
+        body={"type": "anyone", "role": "reader"},
+        supportsAllDrives=True,
+    ).execute()
+    uri = f"https://drive.google.com/uc?export=download&id={file_id}"
+    return file_id, uri
+
+
+def _trash_drive_file(file_id: str) -> None:
+    try:
+        drive = _get_drive_service()
+        drive.files().update(
+            fileId=file_id,
+            body={"trashed": True},
+            supportsAllDrives=True,
+        ).execute()
+    except Exception as exc:
+        print(f"  [JOURNAL WARNING] Could not trash temp chart file {file_id}: {exc}")
+
+
+def sync_category_chart_into_doc(
+    document_id: str,
+    spreadsheet_id: str,
+    service=None,
+) -> bool:
+    """
+    Rebuild Actual vs Estimate bar chart image between CHART markers.
+    Regenerated whenever Sheets Activity Log / Dashboard data is synced.
+    """
+    service = service or get_docs_service()
+    if CHART_START not in read_document_text(document_id, service=service):
+        _ensure_chart_markers(document_id, service=service)
+
+    sheets = agent_sheets.get_sheets_service()
+    agent_sheets.ensure_category_estimate_table(sheets, spreadsheet_id)
+    agent_sheets.ensure_category_bar_chart(sheets, spreadsheet_id)
+
+    category_rows = agent_sheets.get_dashboard_category_rows(spreadsheet_id, sheets=sheets)
+    if not category_rows:
+        labels = list(jm.TASK_CATEGORY_LABELS.values())
+        category_rows = [(label, 0.0, 0.0) for label in labels]
+
+    png_bytes = agent_sheets.render_category_bar_chart_png(category_rows)
+    file_id = ""
+    try:
+        folder_id = _folder_id_for_spreadsheet(spreadsheet_id)
+        file_id, uri = _upload_temp_public_png(
+            png_bytes,
+            f"prdei-category-chart-{spreadsheet_id[:8]}.png",
+            folder_id=folder_id,
+        )
+
+        document = get_document(service, document_id)
+        body_content = _collect_body_elements(document)
+        start_range = _find_marker_indices(body_content, CHART_START)
+        end_range = _find_marker_indices(body_content, CHART_END)
+        if not start_range or not end_range:
+            print("[JOURNAL ERROR] Chart markers missing after ensure.")
+            return False
+
+        _, start_end = start_range
+        end_start, _ = end_range
+        requests = []
+        if start_end < end_start:
+            requests.append(
+                {
+                    "deleteContentRange": {
+                        "range": {"startIndex": start_end, "endIndex": end_start}
+                    }
+                }
+            )
+        # Placeholder newlines, then insert image between them.
+        requests.append(
+            {
+                "insertText": {
+                    "location": {"index": start_end},
+                    "text": "\n \n",
+                }
+            }
+        )
+        requests.append(
+            {
+                "insertInlineImage": {
+                    "location": {"index": start_end + 1},
+                    "uri": uri,
+                    "objectSize": {
+                        "height": {"magnitude": 280, "unit": "PT"},
+                        "width": {"magnitude": 480, "unit": "PT"},
+                    },
+                }
+            }
+        )
+
+        service.documents().batchUpdate(
+            documentId=document_id,
+            body={"requests": requests},
+        ).execute()
+        print("  [JOURNAL] Synced Actual vs Estimate chart image into Doc.")
+        return True
+    except Exception as exc:
+        print(f"  [JOURNAL ERROR] Chart image sync failed: {exc}")
+        return False
+    finally:
+        if file_id:
+            _trash_drive_file(file_id)
+
+
+def sync_sheet_sections_into_doc(
+    document_id: str,
+    spreadsheet_id: str,
+    project_name: str,
+    service=None,
+) -> bool:
+    """
+    Copy Hours + Activity Log from Sheets into the Google Doc marker sections,
+    and re-embed the Actual vs Estimate bar chart below Hours by Category.
+    """
+    service = service or get_docs_service()
+    week_start, week_end, week_label = jm.get_current_week_range()
+    entries = agent_sheets.read_week_entries(
+        spreadsheet_id, week_start=week_start, week_end=week_end
+    )
+    total_hours, hours_by_category = agent_sheets.get_dashboard_totals(spreadsheet_id)
+    category_rows = agent_sheets.get_dashboard_category_rows(spreadsheet_id)
+    if not hours_by_category:
+        hours_by_category = jm.compute_hours_by_category(entries)
+    if not total_hours:
+        total_hours = round(sum(entry.hours for entry in entries), 2)
+
+    estimates = {label: estimate for label, _actual, estimate in category_rows}
+
+    hours_lines = [
+        f"Week of: {week_label}",
+        f"Total Hours: {total_hours:g}",
+        "",
+        "Hours by Category:",
+    ]
+    if hours_by_category or estimates:
+        labels = list(hours_by_category.keys()) or [r[0] for r in category_rows]
+        # Prefer Dashboard category order when available.
+        if category_rows:
+            labels = [r[0] for r in category_rows]
+        for category in labels:
+            actual = hours_by_category.get(category, 0.0)
+            estimate = estimates.get(category, 0.0)
+            if estimate:
+                hours_lines.append(
+                    f"  {category} ........ Actual {actual:g} hrs | Estimate {estimate:g} hrs"
+                )
+            else:
+                hours_lines.append(
+                    f"  {category} ........ Actual {actual:g} hrs | Estimate (enter in Sheet)"
+                )
+    else:
+        hours_lines.append("  (none this week)")
+    hours_lines.append("")
+    hours_lines.append(
+        "(Bar chart of Actual vs Estimate appears in the section below.)"
+    )
+
+    activity_lines = ["Timestamp | User | Hours | Category | Activity"]
+    for entry in entries:
+        activity_lines.append(
+            f"{entry.timestamp_str} | {entry.user} | {entry.hours:g} | "
+            f"{entry.category_label} | {entry.activity}"
+        )
+    if len(activity_lines) == 1:
+        activity_lines.append("(no entries this week)")
+
+    hours_ok = replace_between_markers(
+        document_id,
+        HOURS_START,
+        HOURS_END,
+        "\n".join(hours_lines),
+        service=service,
+    )
+    chart_ok = sync_category_chart_into_doc(
+        document_id, spreadsheet_id, service=service
+    )
+    activity_ok = replace_between_markers(
+        document_id,
+        ACTIVITY_START,
+        ACTIVITY_END,
+        "\n".join(activity_lines),
+        service=service,
+    )
+    print(
+        f"  [JOURNAL] Synced Sheet tables into Doc "
+        f"(hours={hours_ok}, chart={chart_ok}, activity={activity_ok}, "
+        f"entries={len(entries)})"
+    )
+    return hours_ok and activity_ok
 
 
 def _get_genai_client():
@@ -341,7 +674,11 @@ def _update_summary_from_sheet(
         return False
 
     summary_body = render_doc_narrative(week_label, compiled["accomplishments_narrative"])
-    return replace_summary_section(document_id, summary_body, service=service)
+    if not replace_summary_section(document_id, summary_body, service=service):
+        return False
+    return sync_sheet_sections_into_doc(
+        document_id, spreadsheet_id, project_name, service=service
+    )
 
 
 def refresh_weekly_summary(
@@ -371,13 +708,12 @@ def refresh_weekly_summary(
         summary_updated = _update_summary_from_sheet(
             document_id, spreadsheet_id, project_name, service
         )
-        docs_refreshed = agent_sheets.trigger_docs_refresh(
-            document_id, spreadsheet_id, project_name
-        )
+        # Optional Apps Script webhook for native linked charts (if configured).
+        agent_sheets.trigger_docs_refresh(document_id, spreadsheet_id, project_name)
         return JournalUpdateResult(
             success=summary_updated,
             summary_updated=summary_updated,
-            docs_refreshed=docs_refreshed,
+            docs_refreshed=summary_updated,
             spreadsheet_id=spreadsheet_id,
             error_message="" if summary_updated else "Could not refresh weekly summary.",
         )
@@ -434,21 +770,20 @@ def process_journal_update(
             document_id, spreadsheet_id, project_name, service
         )
         if not summary_updated:
-            print("  [JOURNAL WARNING] Sheet saved but Doc narrative update failed.")
+            print("  [JOURNAL WARNING] Sheet saved but Doc narrative/table sync failed.")
 
-        docs_refreshed = agent_sheets.trigger_docs_refresh(
-            document_id, spreadsheet_id, project_name
-        )
+        # Optional extra step for native linked charts if webapp URL is configured.
+        agent_sheets.trigger_docs_refresh(document_id, spreadsheet_id, project_name)
 
         print(
             f"  [JOURNAL SUCCESS] Logged {hours_logged:g} hr(s) to Sheet {spreadsheet_id}; "
-            f"summary_updated={summary_updated}; docs_refreshed={docs_refreshed}"
+            f"summary_updated={summary_updated}"
         )
         return JournalUpdateResult(
             success=log_appended,
             log_appended=log_appended,
             summary_updated=summary_updated,
-            docs_refreshed=docs_refreshed,
+            docs_refreshed=summary_updated,
             hours_logged=hours_logged,
             spreadsheet_id=spreadsheet_id,
         )

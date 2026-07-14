@@ -3,8 +3,9 @@ Google Sheets integration for the project activity log.
 
 The spreadsheet is the source of truth for:
   - Detailed Activity Log rows
-  - Total Hours (formula)
-  - Hours by Category (QUERY formula)
+  - Total Hours / Actual Hours by Category (formulas)
+  - Estimate hours by Category (manual)
+  - Bar chart: Actual (color) vs Estimate (gray)
 
 Per-project sheets live in the project Drive folder and are named
 "Detailed Activity Log" (see project_router.ensure_project_assets).
@@ -28,6 +29,9 @@ SHEETS_SCOPES = [
 
 ACTIVITY_TAB = "ActivityLog"
 DASHBOARD_TAB = "Dashboard"
+CATEGORY_CHART_TITLE = "Actual vs Estimate by Category"
+# Dashboard category table: header row 5, data rows 6..(5+N)
+CATEGORY_HEADER_ROW = 5
 
 ACTIVITY_HEADERS = [
     "Timestamp",
@@ -59,6 +63,10 @@ def _ensure_tab(sheets, spreadsheet_id: str, title: str) -> None:
     ).execute()
 
 
+def _category_labels() -> list[str]:
+    return list(jm.TASK_CATEGORY_LABELS.values())
+
+
 def _write_headers_and_dashboard(sheets, spreadsheet_id: str) -> None:
     sheets.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id,
@@ -67,30 +75,226 @@ def _write_headers_and_dashboard(sheets, spreadsheet_id: str) -> None:
         body={"values": [ACTIVITY_HEADERS]},
     ).execute()
 
-    dashboard_rows = [
+    dashboard_top = [
         ["Week Start", ""],
         ["Week Of", ""],
         ["Total Hours", f"=IFERROR(SUMIF({ACTIVITY_TAB}!F:F,B1,{ACTIVITY_TAB}!C:C),0)"],
         [""],
-        ["Hours by Category", ""],
-        [
-            f'=IFERROR(QUERY({ACTIVITY_TAB}!A:F,'
-            f'"select D, sum(C) where F = date \'"&TEXT(B1,"yyyy-mm-dd")&"\' '
-            f'group by D label D \'Category\', sum(C) \'Hours\'",1),"No entries this week")'
-        ],
+        ["Hours by Category (edit Estimate column manually)", ""],
     ]
     sheets.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id,
-        range=f"{DASHBOARD_TAB}!A1:B6",
+        range=f"{DASHBOARD_TAB}!A1:B5",
         valueInputOption="USER_ENTERED",
-        body={"values": dashboard_rows},
+        body={"values": dashboard_top},
     ).execute()
+    ensure_category_estimate_table(sheets, spreadsheet_id)
+
+
+def ensure_category_estimate_table(sheets, spreadsheet_id: str) -> None:
+    """
+    Category | Actual Hours | Estimate table.
+    Actual Hours are formulas; Estimate is manual user input (preserved on update).
+    """
+    labels = _category_labels()
+    last_row = CATEGORY_HEADER_ROW + len(labels)
+    existing = (
+        sheets.spreadsheets()
+        .values()
+        .get(
+            spreadsheetId=spreadsheet_id,
+            range=f"{DASHBOARD_TAB}!A{CATEGORY_HEADER_ROW}:C{last_row}",
+        )
+        .execute()
+        .get("values")
+        or []
+    )
+
+    prior_estimates: dict[str, str | float] = {}
+    for row in existing[1:]:
+        if not row:
+            continue
+        label = str(row[0]).strip()
+        estimate = row[2] if len(row) > 2 else ""
+        if label:
+            prior_estimates[label] = estimate
+
+    rows: list[list] = [["Category", "Actual Hours", "Estimate"]]
+    for offset, label in enumerate(labels):
+        row_num = CATEGORY_HEADER_ROW + 1 + offset
+        actual_formula = (
+            f"=IFERROR(SUMIFS({ACTIVITY_TAB}!C:C,"
+            f"{ACTIVITY_TAB}!D:D,A{row_num},"
+            f"{ACTIVITY_TAB}!F:F,$B$1),0)"
+        )
+        rows.append([label, actual_formula, prior_estimates.get(label, "")])
+
+    sheets.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=f"{DASHBOARD_TAB}!A{CATEGORY_HEADER_ROW}:C{last_row}",
+        valueInputOption="USER_ENTERED",
+        body={"values": rows},
+    ).execute()
+
+
+def ensure_category_bar_chart(sheets, spreadsheet_id: str) -> int:
+    """
+    Ensure a column chart exists: Actual (colored) vs Estimate (gray) by category.
+    Returns the Sheets chart ID.
+    """
+    meta = (
+        sheets.spreadsheets()
+        .get(
+            spreadsheetId=spreadsheet_id,
+            fields="sheets(properties,charts)",
+        )
+        .execute()
+    )
+    dashboard_id = None
+    existing_chart_id = None
+    for sheet in meta.get("sheets", []):
+        props = sheet.get("properties", {})
+        if props.get("title") != DASHBOARD_TAB:
+            continue
+        dashboard_id = int(props["sheetId"])
+        for chart in sheet.get("charts") or []:
+            title = (chart.get("spec") or {}).get("title", "")
+            if title == CATEGORY_CHART_TITLE:
+                existing_chart_id = int(chart["chartId"])
+                break
+    if dashboard_id is None:
+        raise ValueError("Dashboard tab missing")
+
+    labels = _category_labels()
+    start_row = CATEGORY_HEADER_ROW - 1
+    end_row = CATEGORY_HEADER_ROW + len(labels)
+
+    chart_spec = {
+        "title": CATEGORY_CHART_TITLE,
+        "basicChart": {
+            "chartType": "COLUMN",
+            "legendPosition": "BOTTOM_LEGEND",
+            "headerCount": 1,
+            "axis": [
+                {"position": "BOTTOM_AXIS", "title": "Category"},
+                {"position": "LEFT_AXIS", "title": "Hours"},
+            ],
+            "domains": [
+                {
+                    "domain": {
+                        "sourceRange": {
+                            "sources": [
+                                {
+                                    "sheetId": dashboard_id,
+                                    "startRowIndex": start_row,
+                                    "endRowIndex": end_row,
+                                    "startColumnIndex": 0,
+                                    "endColumnIndex": 1,
+                                }
+                            ]
+                        }
+                    }
+                }
+            ],
+            "series": [
+                {
+                    "series": {
+                        "sourceRange": {
+                            "sources": [
+                                {
+                                    "sheetId": dashboard_id,
+                                    "startRowIndex": start_row,
+                                    "endRowIndex": end_row,
+                                    "startColumnIndex": 1,
+                                    "endColumnIndex": 2,
+                                }
+                            ]
+                        }
+                    },
+                    "targetAxis": "LEFT_AXIS",
+                    "colorStyle": {
+                        "rgbColor": {"red": 0.20, "green": 0.55, "blue": 0.90}
+                    },
+                },
+                {
+                    "series": {
+                        "sourceRange": {
+                            "sources": [
+                                {
+                                    "sheetId": dashboard_id,
+                                    "startRowIndex": start_row,
+                                    "endRowIndex": end_row,
+                                    "startColumnIndex": 2,
+                                    "endColumnIndex": 3,
+                                }
+                            ]
+                        }
+                    },
+                    "targetAxis": "LEFT_AXIS",
+                    "colorStyle": {
+                        "rgbColor": {"red": 0.75, "green": 0.75, "blue": 0.75}
+                    },
+                },
+            ],
+        },
+    }
+
+    if existing_chart_id is not None:
+        sheets.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "requests": [
+                    {
+                        "updateChartSpec": {
+                            "chartId": existing_chart_id,
+                            "spec": chart_spec,
+                        }
+                    }
+                ]
+            },
+        ).execute()
+        return existing_chart_id
+
+    response = (
+        sheets.spreadsheets()
+        .batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "requests": [
+                    {
+                        "addChart": {
+                            "chart": {
+                                "spec": chart_spec,
+                                "position": {
+                                    "overlayPosition": {
+                                        "anchorCell": {
+                                            "sheetId": dashboard_id,
+                                            "rowIndex": CATEGORY_HEADER_ROW
+                                            + len(labels)
+                                            + 1,
+                                            "columnIndex": 0,
+                                        },
+                                        "widthPixels": 560,
+                                        "heightPixels": 360,
+                                    }
+                                },
+                            }
+                        }
+                    }
+                ]
+            },
+        )
+        .execute()
+    )
+    replies = response.get("replies") or []
+    chart_id = replies[0]["addChart"]["chart"]["chartId"]
+    print(f"  [SHEETS] Created bar chart '{CATEGORY_CHART_TITLE}' id={chart_id}")
+    return int(chart_id)
 
 
 def ensure_spreadsheet(project_name: str, spreadsheet_id: str = "") -> str:
     """
-    Ensure ActivityLog + Dashboard tabs/formulas exist on an existing spreadsheet.
-    spreadsheet_id should come from project_router.ensure_project_assets().
+    Ensure ActivityLog + Dashboard tabs/formulas/chart exist.
     """
     sheets = get_sheets_service()
     if not spreadsheet_id:
@@ -111,7 +315,19 @@ def ensure_spreadsheet(project_name: str, spreadsheet_id: str = "") -> str:
     )
     if not header:
         _write_headers_and_dashboard(sheets, spreadsheet_id)
+    else:
+        ensure_category_estimate_table(sheets, spreadsheet_id)
+    ensure_category_bar_chart(sheets, spreadsheet_id)
     return spreadsheet_id
+
+
+def get_category_bar_chart_id(spreadsheet_id: str, sheets=None) -> int | None:
+    sheets = sheets or get_sheets_service()
+    try:
+        return ensure_category_bar_chart(sheets, spreadsheet_id)
+    except Exception as exc:
+        print(f"  [SHEETS WARNING] Could not ensure bar chart: {exc}")
+        return None
 
 
 def update_dashboard_week(
@@ -203,17 +419,64 @@ def read_week_entries(
     return jm.filter_entries_for_week(entries, week_start, week_end)
 
 
-def get_dashboard_totals(
+def get_dashboard_category_rows(
     spreadsheet_id: str,
     sheets=None,
-) -> tuple[float, dict[str, float]]:
+) -> list[tuple[str, float, float]]:
+    """
+    Return [(category_label, actual_hours, estimate_hours), ...] from Dashboard.
+    Manual Estimate cells that are blank become 0.0 for charting.
+    """
     sheets = sheets or get_sheets_service()
+    labels = _category_labels()
+    last_row = CATEGORY_HEADER_ROW + len(labels)
     result = (
         sheets.spreadsheets()
         .values()
         .get(
             spreadsheetId=spreadsheet_id,
-            range=f"{DASHBOARD_TAB}!A1:B40",
+            range=f"{DASHBOARD_TAB}!A{CATEGORY_HEADER_ROW}:C{last_row}",
+            valueRenderOption="UNFORMATTED_VALUE",
+        )
+        .execute()
+    )
+    values = result.get("values") or []
+    rows: list[tuple[str, float, float]] = []
+    for row in values[1:]:
+        if not row:
+            continue
+        label = str(row[0]).strip()
+        if not label or label.lower() == "category":
+            continue
+        actual = 0.0
+        estimate = 0.0
+        if len(row) > 1 and row[1] != "" and row[1] is not None:
+            try:
+                actual = round(float(row[1]), 2)
+            except (TypeError, ValueError):
+                actual = 0.0
+        if len(row) > 2 and row[2] != "" and row[2] is not None:
+            try:
+                estimate = round(float(row[2]), 2)
+            except (TypeError, ValueError):
+                estimate = 0.0
+        rows.append((label, actual, estimate))
+    return rows
+
+
+def get_dashboard_totals(
+    spreadsheet_id: str,
+    sheets=None,
+) -> tuple[float, dict[str, float]]:
+    sheets = sheets or get_sheets_service()
+    labels = _category_labels()
+    last_row = CATEGORY_HEADER_ROW + len(labels)
+    result = (
+        sheets.spreadsheets()
+        .values()
+        .get(
+            spreadsheetId=spreadsheet_id,
+            range=f"{DASHBOARD_TAB}!A1:C{last_row}",
             valueRenderOption="UNFORMATTED_VALUE",
         )
         .execute()
@@ -227,21 +490,111 @@ def get_dashboard_totals(
             total = 0.0
 
     hours_by_category: dict[str, float] = {}
-    for row in values[5:]:
+    # Skip A1:A5 preface; category header is sheet row 5 (index 4).
+    for row in values[CATEGORY_HEADER_ROW:]:
         if len(row) < 2:
             continue
         label = str(row[0]).strip()
-        if not label or label.lower() in {
-            "category",
-            "hours by category",
-            "no entries this week",
-        }:
+        if not label or label.lower() == "category":
             continue
         try:
             hours_by_category[label] = round(float(row[1]), 2)
         except (TypeError, ValueError):
             continue
     return total, hours_by_category
+
+
+def render_category_bar_chart_png(
+    category_rows: list[tuple[str, float, float]],
+) -> bytes:
+    """
+    Grouped bar chart: Actual (per-category color) beside Estimate (gray).
+    Used for embedding into the Google Doc (Docs API has no linked-chart refresh).
+    """
+    import io
+
+    from PIL import Image, ImageDraw, ImageFont
+
+    labels = [r[0] for r in category_rows] or ["(none)"]
+    actuals = [r[1] for r in category_rows] or [0.0]
+    estimates = [r[2] for r in category_rows] or [0.0]
+
+    # Distinct blues/teals for Actual series bars (one per category).
+    actual_palette = [
+        (51, 140, 230),
+        (36, 168, 142),
+        (230, 140, 51),
+        (120, 90, 200),
+        (200, 80, 110),
+    ]
+    estimate_color = (191, 191, 191)
+
+    width, height = 720, 420
+    margin_left, margin_right = 70, 30
+    margin_top, margin_bottom = 50, 110
+    img = Image.new("RGB", (width, height), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.load_default()
+        title_font = ImageFont.load_default()
+    except Exception:
+        font = title_font = None
+
+    draw.text((margin_left, 12), CATEGORY_CHART_TITLE, fill=(40, 40, 40), font=title_font)
+
+    plot_left = margin_left
+    plot_right = width - margin_right
+    plot_top = margin_top
+    plot_bottom = height - margin_bottom
+    plot_width = plot_right - plot_left
+    plot_height = plot_bottom - plot_top
+
+    max_val = max(max(actuals + estimates + [1.0]), 1.0)
+    # Nice upper bound
+    nice_max = max_val * 1.15
+
+    n = len(labels)
+    group_width = plot_width / max(n, 1)
+    bar_width = group_width * 0.32
+    gap = group_width * 0.08
+
+    # Axes
+    draw.line([(plot_left, plot_top), (plot_left, plot_bottom)], fill=(80, 80, 80), width=1)
+    draw.line([(plot_left, plot_bottom), (plot_right, plot_bottom)], fill=(80, 80, 80), width=1)
+
+    for i, (label, actual, estimate) in enumerate(zip(labels, actuals, estimates)):
+        group_x = plot_left + i * group_width + group_width * 0.15
+        actual_h = (actual / nice_max) * plot_height
+        estimate_h = (estimate / nice_max) * plot_height
+        actual_color = actual_palette[i % len(actual_palette)]
+
+        ax0 = group_x
+        ay0 = plot_bottom - actual_h
+        draw.rectangle([ax0, ay0, ax0 + bar_width, plot_bottom], fill=actual_color)
+
+        ex0 = group_x + bar_width + gap
+        ey0 = plot_bottom - estimate_h
+        draw.rectangle([ex0, ey0, ex0 + bar_width, plot_bottom], fill=estimate_color)
+
+        # Truncate long labels
+        short = label if len(label) <= 16 else label[:14] + "…"
+        # Approximate text width for centering under the pair of bars
+        tx = group_x + bar_width + gap / 2 - (len(short) * 3)
+        draw.text((max(plot_left, tx), plot_bottom + 8), short, fill=(50, 50, 50), font=font)
+
+    # Legend
+    legend_y = height - 48
+    draw.rectangle([margin_left, legend_y, margin_left + 14, legend_y + 14], fill=actual_palette[0])
+    draw.text((margin_left + 20, legend_y), "Actual", fill=(50, 50, 50), font=font)
+    draw.rectangle(
+        [margin_left + 90, legend_y, margin_left + 104, legend_y + 14],
+        fill=estimate_color,
+    )
+    draw.text((margin_left + 110, legend_y), "Estimate", fill=(50, 50, 50), font=font)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def trigger_docs_refresh(
@@ -251,9 +604,7 @@ def trigger_docs_refresh(
     webapp_url: str = "",
 ) -> bool:
     """
-    Call the deployed Apps Script web app to rebuild Doc tables from Sheets.
-
-    Google Docs does not expose native "Update all" for linked charts/tables.
+    Optional Apps Script webhook. Doc table/chart sync is handled in Python.
     """
     import json
     import os
@@ -262,11 +613,6 @@ def trigger_docs_refresh(
 
     url = (webapp_url or "").strip() or os.environ.get("DOCS_REFRESH_WEBAPP_URL", "").strip()
     if not url:
-        print(
-            "  [SHEETS] DOCS_REFRESH_WEBAPP_URL not set — "
-            "skipping Doc table refresh. Linked charts still need a manual Update, "
-            "or deploy apps_script/Code.gs as a web app."
-        )
         return False
 
     payload = json.dumps(
