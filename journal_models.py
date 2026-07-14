@@ -12,8 +12,8 @@ from zoneinfo import ZoneInfo
 
 JOURNAL_TIMEZONE = os.environ.get("JOURNAL_TIMEZONE", "America/Los_Angeles")
 
-SUMMARY_HEADING = "--- WEEKLY SUMMARY (AUTO-GENERATED) ---"
-DETAIL_LOG_HEADING = "--- DETAILED ACTIVITY LOG ---"
+SUMMARY_HEADING = "Weekly Summary"
+DETAIL_LOG_HEADING = "Detailed Activity Log"
 LEGACY_HEADING = "--- LEGACY ENTRIES (ARCHIVED) ---"
 
 DURATION_ROW_COUNTS = {
@@ -224,13 +224,13 @@ def render_summary_body(
         "Hours by Category:",
     ]
     for category, hours in hours_by_category.items():
-        padding = max(1, 28 - len(category))
-        lines.append(f"  {category} {'.' * padding} {hours:g} hrs")
+        lines.append(category)
+        lines.append(f"Actual {hours:g} hrs")
+        lines.append("")
 
     lines.extend(
         [
-            "",
-            "Accomplishments:",
+            "Accomplishments",
             accomplishments_narrative.strip(),
         ]
     )

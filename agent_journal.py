@@ -38,12 +38,25 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-HOURS_START = "--- HOURS SUMMARY (FROM SHEETS) ---"
-HOURS_END = "--- END HOURS SUMMARY ---"
-CHART_START = "--- CATEGORY CHART (FROM SHEETS) ---"
-CHART_END = "--- END CATEGORY CHART ---"
-ACTIVITY_START = "--- DETAILED ACTIVITY LOG ---"
-ACTIVITY_END = "--- END DETAILED ACTIVITY LOG ---"
+HOURS_START = "Hours Summary"
+CHART_START = "Category Chart"
+ACTIVITY_START = "Detailed Activity Log"
+
+# Document Heading 1: 14 pt, bold, PRDEI blue
+HEADING1_RGB = (69, 176, 225)  # #45B0E1
+HEADING1_FONT_PT = 14
+HEADING1_TITLES = (
+    "Weekly Summary",
+    "Hours Summary",
+    "Hours by Category:",
+    "Category Chart",
+    "Detailed Activity Log",
+)
+
+# Normal text + bold (not a separate named style)
+BOLD_NORMAL_EXACT_TITLES = (
+    "Accomplishments",
+)
 
 
 @dataclass
@@ -65,6 +78,151 @@ def get_docs_service():
         print(f"[AUTH ERROR] Failed to obtain Application Default Credentials: {exc}")
         print(" -> To run locally, execute: gcloud auth application-default login")
         raise exc
+
+
+def _heading1_text_style() -> dict:
+    r, g, b = HEADING1_RGB
+    return {
+        "bold": True,
+        "fontSize": {"magnitude": float(HEADING1_FONT_PT), "unit": "PT"},
+        "foregroundColor": {
+            "color": {
+                "rgbColor": {
+                    "red": r / 255.0,
+                    "green": g / 255.0,
+                    "blue": b / 255.0,
+                }
+            }
+        },
+    }
+
+
+def _style_paragraph_requests(
+    start: int,
+    end: int,
+    named_style: str,
+    text_style: dict,
+    text_style_fields: str = "bold,fontSize,foregroundColor",
+) -> list[dict]:
+    """Build paragraph + text style update requests for one title range."""
+    requests = [
+        {
+            "updateParagraphStyle": {
+                "range": {"startIndex": start, "endIndex": end},
+                "paragraphStyle": {"namedStyleType": named_style},
+                "fields": "namedStyleType",
+            }
+        }
+    ]
+    text_end = end - 1 if end > start else end
+    if text_end > start:
+        requests.append(
+            {
+                "updateTextStyle": {
+                    "range": {"startIndex": start, "endIndex": text_end},
+                    "textStyle": text_style,
+                    "fields": text_style_fields,
+                }
+            }
+        )
+    return requests
+
+
+def ensure_document_heading_styles(document_id: str, service=None) -> bool:
+    """Define the Heading 1 named style for the document."""
+    service = service or get_docs_service()
+    try:
+        service.documents().batchUpdate(
+            documentId=document_id,
+            body={
+                "requests": [
+                    {
+                        "updateNamedStyle": {
+                            "namedStyle": {
+                                "namedStyleType": "HEADING_1",
+                                "textStyle": _heading1_text_style(),
+                            },
+                            "fields": (
+                                "namedStyleType,"
+                                "textStyle.bold,"
+                                "textStyle.fontSize,"
+                                "textStyle.foregroundColor"
+                            ),
+                        }
+                    }
+                ]
+            },
+        ).execute()
+        print(
+            f"  [JOURNAL] Heading 1 style set to {HEADING1_FONT_PT}pt "
+            f"bold RGB{HEADING1_RGB}"
+        )
+        return True
+    except Exception as exc:
+        print(f"  [JOURNAL WARNING] Could not update heading named styles: {exc}")
+        return False
+
+
+def _is_bold_normal_paragraph(text: str, category_labels: set[str]) -> bool:
+    stripped = text.strip()
+    if stripped in BOLD_NORMAL_EXACT_TITLES:
+        return True
+    if stripped.startswith("Total Hours:"):
+        return True
+    if stripped in category_labels:
+        return True
+    return False
+
+
+def apply_document_heading_styles(document_id: str, service=None) -> tuple[int, int]:
+    """
+    Apply Heading 1 to section titles, and Normal text + bold to
+    Accomplishments / Total Hours / category names.
+    Returns (h1_count, bold_normal_count).
+    """
+    service = service or get_docs_service()
+    document = get_document(service, document_id)
+    body_content = _collect_body_elements(document)
+    h1_titles = {t.strip() for t in HEADING1_TITLES}
+    category_labels = set(jm.TASK_CATEGORY_LABELS.values())
+    requests: list[dict] = []
+    h1_count = 0
+    bold_count = 0
+
+    for element in body_content:
+        if "paragraph" not in element:
+            continue
+        text = _paragraph_text(element).strip()
+        start = element.get("startIndex")
+        end = element.get("endIndex")
+        if start is None or end is None or start >= end:
+            continue
+
+        if text in h1_titles:
+            requests.extend(
+                _style_paragraph_requests(
+                    start, end, "HEADING_1", _heading1_text_style()
+                )
+            )
+            h1_count += 1
+        elif _is_bold_normal_paragraph(text, category_labels):
+            requests.extend(
+                _style_paragraph_requests(
+                    start,
+                    end,
+                    "NORMAL_TEXT",
+                    {"bold": True},
+                    text_style_fields="bold",
+                )
+            )
+            bold_count += 1
+
+    if requests:
+        service.documents().batchUpdate(
+            documentId=document_id,
+            body={"requests": requests},
+        ).execute()
+    return h1_count, bold_count
 
 
 def get_document(service, document_id: str) -> dict:
@@ -122,15 +280,12 @@ def _build_doc_header(project_name: str, week_label: str) -> str:
         f"{jm.SUMMARY_HEADING}\n"
         "(Accomplishments narrative will appear after your first entry this week.)\n\n"
         f"{HOURS_START}\n"
-        "(Hours summary syncs from the Google Sheet Dashboard after each log entry.)\n"
-        f"{HOURS_END}\n\n"
+        "(Hours summary syncs from the Google Sheet Dashboard after each log entry.)\n\n"
         f"{CHART_START}\n"
-        "(Actual vs Estimate chart syncs from the Sheet Dashboard.)\n"
-        f"{CHART_END}\n\n"
+        "(Actual vs Estimate chart syncs from the Sheet Dashboard.)\n\n"
         f"{ACTIVITY_START}\n"
         "(Detailed Activity Log lives in Google Sheets and syncs here after each "
         "Slack submission.)\n"
-        f"{ACTIVITY_END}\n"
     )
 
 
@@ -155,9 +310,14 @@ def initialize_document_structure(
         and ACTIVITY_START in existing_text
     )
     if has_core_markers and CHART_START in existing_text:
+        ensure_document_heading_styles(document_id, service=service)
+        apply_document_heading_styles(document_id, service=service)
         return True
     if has_core_markers and CHART_START not in existing_text:
-        return _ensure_chart_markers(document_id, service=service)
+        ok = _ensure_chart_markers(document_id, service=service)
+        ensure_document_heading_styles(document_id, service=service)
+        apply_document_heading_styles(document_id, service=service)
+        return ok
 
     end_index = body_content[-1].get("endIndex", 1) - 1
     replacement = _build_doc_header(project_name, week_label)
@@ -184,25 +344,25 @@ def initialize_document_structure(
         documentId=document_id,
         body={"requests": requests},
     ).execute()
+    ensure_document_heading_styles(document_id, service=service)
+    apply_document_heading_styles(document_id, service=service)
     print(f"  [JOURNAL] Initialized document structure for {document_id}")
     return True
 
 
 def _ensure_chart_markers(document_id: str, service=None) -> bool:
-    """Insert chart section markers after Hours if an older Doc lacks them."""
+    """Insert Category Chart heading before Detailed Activity Log if missing."""
     service = service or get_docs_service()
     document = get_document(service, document_id)
     body_content = _collect_body_elements(document)
-    hours_end = _find_marker_indices(body_content, HOURS_END)
     activity_start = _find_marker_indices(body_content, ACTIVITY_START)
-    if not hours_end or not activity_start:
-        print("[JOURNAL WARNING] Could not insert chart markers — hours/activity missing.")
+    if not activity_start:
+        print("[JOURNAL WARNING] Could not insert chart section — activity heading missing.")
         return False
-    _, hours_end_idx = hours_end
+    activity_idx, _ = activity_start
     insert_text = (
-        f"\n{CHART_START}\n"
-        "(Actual vs Estimate chart syncs from the Sheet Dashboard.)\n"
-        f"{CHART_END}\n"
+        f"{CHART_START}\n"
+        "(Actual vs Estimate chart syncs from the Sheet Dashboard.)\n\n"
     )
     service.documents().batchUpdate(
         documentId=document_id,
@@ -210,15 +370,62 @@ def _ensure_chart_markers(document_id: str, service=None) -> bool:
             "requests": [
                 {
                     "insertText": {
-                        "location": {"index": hours_end_idx},
+                        "location": {"index": activity_idx},
                         "text": insert_text,
                     }
                 }
             ]
         },
     ).execute()
-    print("  [JOURNAL] Inserted category chart markers into document.")
+    print("  [JOURNAL] Inserted Category Chart section into document.")
     return True
+
+
+def _force_normal_text_range(
+    document_id: str,
+    start_index: int,
+    end_index: int,
+    service=None,
+) -> None:
+    """
+    Apply Google Docs' built-in "Normal text" named style (API: NORMAL_TEXT).
+
+    Text inserted after a Heading 1 paragraph inherits HEADING_1; this resets
+    those paragraphs to Normal text. Direct run formatting (bold/size/color)
+    inherited from H1 is cleared so the Normal text style can show through.
+    """
+    if start_index is None or end_index is None or start_index >= end_index:
+        return
+    service = service or get_docs_service()
+    service.documents().batchUpdate(
+        documentId=document_id,
+        body={
+            "requests": [
+                {
+                    "updateParagraphStyle": {
+                        "range": {
+                            "startIndex": start_index,
+                            "endIndex": end_index,
+                        },
+                        # Docs UI: Styles → Normal text
+                        "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                        "fields": "namedStyleType",
+                    }
+                },
+                {
+                    # Clear direct formatting so the Normal text named style applies.
+                    "updateTextStyle": {
+                        "range": {
+                            "startIndex": start_index,
+                            "endIndex": end_index,
+                        },
+                        "textStyle": {},
+                        "fields": "bold,italic,fontSize,foregroundColor",
+                    }
+                },
+            ]
+        },
+    ).execute()
 
 
 def replace_summary_section(
@@ -251,11 +458,12 @@ def replace_summary_section(
                 }
             }
         )
+    insert_text = f"\n{summary_body}\n"
     requests.append(
         {
             "insertText": {
                 "location": {"index": summary_end},
-                "text": f"\n{summary_body}\n",
+                "text": insert_text,
             }
         }
     )
@@ -263,37 +471,56 @@ def replace_summary_section(
         documentId=document_id,
         body={"requests": requests},
     ).execute()
+
+    # Inserted copy inherits Heading 1 from "Weekly Summary" — force Normal Text.
+    inserted_end = summary_end + len(insert_text)
+    _force_normal_text_range(document_id, summary_end, inserted_end, service=service)
     return True
 
 
-def replace_between_markers(
+def _section_end_index(body_content: list[dict], until_markers: list[str]) -> int | None:
+    """
+    Index where the next section starts (content before this index is this section's
+    body). If none of until_markers exist, use the end of the document body.
+    """
+    for marker in until_markers:
+        found = _find_marker_indices(body_content, marker)
+        if found:
+            return found[0]
+    if not body_content:
+        return None
+    return body_content[-1].get("endIndex", 1) - 1
+
+
+def replace_section_body(
     document_id: str,
     start_marker: str,
-    end_marker: str,
     body_text: str,
+    until_markers: list[str],
     service=None,
 ) -> bool:
-    """Replace everything between two marker paragraphs (markers kept)."""
+    """
+    Replace content after start_marker until the first found until_marker
+    (next section heading). Markers themselves are kept. If no until_marker
+    is present, replaces through the end of the document body.
+    """
     service = service or get_docs_service()
     document = get_document(service, document_id)
     body_content = _collect_body_elements(document)
 
     start_range = _find_marker_indices(body_content, start_marker)
-    end_range = _find_marker_indices(body_content, end_marker)
-    if not start_range or not end_range:
-        print(
-            f"[JOURNAL ERROR] Missing markers for section sync: "
-            f"{start_marker!r} / {end_marker!r}"
-        )
+    if not start_range:
+        print(f"[JOURNAL ERROR] Missing section start marker: {start_marker!r}")
         return False
 
     _, start_end = start_range
-    end_start, _ = end_range
-    if start_end > end_start:
-        print(f"[JOURNAL ERROR] Invalid marker range for {start_marker!r}.")
+    end_start = _section_end_index(body_content, until_markers)
+    if end_start is None or start_end > end_start:
+        print(f"[JOURNAL ERROR] Invalid section range for {start_marker!r}.")
         return False
 
     text = body_text if body_text.endswith("\n") else body_text + "\n"
+    insert_text = f"\n{text}"
     requests = []
     if start_end < end_start:
         requests.append(
@@ -307,7 +534,7 @@ def replace_between_markers(
         {
             "insertText": {
                 "location": {"index": start_end},
-                "text": f"\n{text}",
+                "text": insert_text,
             }
         }
     )
@@ -315,6 +542,10 @@ def replace_between_markers(
         documentId=document_id,
         body={"requests": requests},
     ).execute()
+
+    # Body under an H1 section title must not inherit Heading 1.
+    inserted_end = start_end + len(insert_text)
+    _force_normal_text_range(document_id, start_end, inserted_end, service=service)
     return True
 
 
@@ -416,13 +647,15 @@ def sync_category_chart_into_doc(
         document = get_document(service, document_id)
         body_content = _collect_body_elements(document)
         start_range = _find_marker_indices(body_content, CHART_START)
-        end_range = _find_marker_indices(body_content, CHART_END)
-        if not start_range or not end_range:
-            print("[JOURNAL ERROR] Chart markers missing after ensure.")
+        end_start = _section_end_index(body_content, [ACTIVITY_START, jm.LEGACY_HEADING])
+        if not start_range or end_start is None:
+            print("[JOURNAL ERROR] Chart section bounds missing after ensure.")
             return False
 
         _, start_end = start_range
-        end_start, _ = end_range
+        if start_end > end_start:
+            print("[JOURNAL ERROR] Invalid chart section range.")
+            return False
         requests = []
         if start_end < end_start:
             requests.append(
@@ -506,20 +739,20 @@ def sync_sheet_sections_into_doc(
         for category in labels:
             actual = hours_by_category.get(category, 0.0)
             estimate = estimates.get(category, 0.0)
+            # Category name alone so it can receive Heading 2 styling.
+            hours_lines.append(category)
             if estimate:
                 hours_lines.append(
-                    f"  {category} ........ Actual {actual:g} hrs | Estimate {estimate:g} hrs"
+                    f"Actual {actual:g} hrs | Estimate {estimate:g} hrs"
                 )
             else:
                 hours_lines.append(
-                    f"  {category} ........ Actual {actual:g} hrs | Estimate (enter in Sheet)"
+                    f"Actual {actual:g} hrs | Estimate (enter in Sheet)"
                 )
+            hours_lines.append("")
     else:
-        hours_lines.append("  (none this week)")
-    hours_lines.append("")
-    hours_lines.append(
-        "(Bar chart of Actual vs Estimate appears in the section below.)"
-    )
+        hours_lines.append("(none this week)")
+    
 
     activity_lines = ["Timestamp | User | Hours | Category | Activity"]
     for entry in entries:
@@ -530,21 +763,21 @@ def sync_sheet_sections_into_doc(
     if len(activity_lines) == 1:
         activity_lines.append("(no entries this week)")
 
-    hours_ok = replace_between_markers(
+    hours_ok = replace_section_body(
         document_id,
         HOURS_START,
-        HOURS_END,
         "\n".join(hours_lines),
+        until_markers=[CHART_START, ACTIVITY_START, jm.LEGACY_HEADING],
         service=service,
     )
     chart_ok = sync_category_chart_into_doc(
         document_id, spreadsheet_id, service=service
     )
-    activity_ok = replace_between_markers(
+    activity_ok = replace_section_body(
         document_id,
         ACTIVITY_START,
-        ACTIVITY_END,
         "\n".join(activity_lines),
+        until_markers=[jm.LEGACY_HEADING],
         service=service,
     )
     print(
@@ -552,6 +785,10 @@ def sync_sheet_sections_into_doc(
         f"(hours={hours_ok}, chart={chart_ok}, activity={activity_ok}, "
         f"entries={len(entries)})"
     )
+    ensure_document_heading_styles(document_id, service=service)
+    h1_n, bold_n = apply_document_heading_styles(document_id, service=service)
+    if h1_n or bold_n:
+        print(f"  [JOURNAL] Applied styles (H1={h1_n}, bold Normal={bold_n}).")
     return hours_ok and activity_ok
 
 
@@ -630,11 +867,10 @@ Return JSON with exactly these fields:
     }
 
 
-def render_doc_narrative(week_label: str, accomplishments_narrative: str) -> str:
+def render_doc_narrative(accomplishments_narrative: str) -> str:
     narrative = (accomplishments_narrative or "").strip()
     return (
-        f"Week of {week_label}\n\n"
-        "Accomplishments:\n"
+        "Accomplishments\n"
         f"{narrative}\n\n"
         "_Total Hours and Hours by Category are maintained in the linked Google Sheet "
         "Dashboard and synced into the Hours Summary section below._\n"
@@ -673,7 +909,7 @@ def _update_summary_from_sheet(
     if not compiled:
         return False
 
-    summary_body = render_doc_narrative(week_label, compiled["accomplishments_narrative"])
+    summary_body = render_doc_narrative(compiled["accomplishments_narrative"])
     if not replace_summary_section(document_id, summary_body, service=service):
         return False
     return sync_sheet_sections_into_doc(

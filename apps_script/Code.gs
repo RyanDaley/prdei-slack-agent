@@ -21,12 +21,10 @@
  * -------------------------------------------------------------------------
  */
 
-var HOURS_START = '--- HOURS SUMMARY (FROM SHEETS) ---';
-var HOURS_END = '--- END HOURS SUMMARY ---';
-var CHART_START = '--- CATEGORY CHART (FROM SHEETS) ---';
-var CHART_END = '--- END CATEGORY CHART ---';
-var ACTIVITY_START = '--- DETAILED ACTIVITY LOG ---';
-var ACTIVITY_END = '--- END DETAILED ACTIVITY LOG ---';
+var HOURS_START = 'Hours Summary';
+var CHART_START = 'Category Chart';
+var ACTIVITY_START = 'Detailed Activity Log';
+var LEGACY_HEADING = '--- LEGACY ENTRIES (ARCHIVED) ---';
 var ACTIVITY_TAB = 'ActivityLog';
 var DASHBOARD_TAB = 'Dashboard';
 var CATEGORY_CHART_TITLE = 'Actual vs Estimate by Category';
@@ -86,14 +84,13 @@ function refreshDocFromSheet_(documentId, spreadsheetId, projectName) {
   ];
   categoryRows.forEach(function (row) {
     var estimate = row[2] ? String(row[2]) : '(enter in Sheet)';
-    hoursLines.push(
-      '  ' + row[0] + ' ........ Actual ' + row[1] + ' hrs | Estimate ' + estimate + ' hrs'
-    );
+    hoursLines.push(row[0]);
+    hoursLines.push('Actual ' + row[1] + ' hrs | Estimate ' + estimate + ' hrs');
+    hoursLines.push('');
   });
   if (categoryRows.length === 0) {
-    hoursLines.push('  (none this week)');
+    hoursLines.push('(none this week)');
   }
-  hoursLines.push('');
   hoursLines.push('(Bar chart of Actual vs Estimate appears in the section below.)');
 
   var activityValues = activity.getDataRange().getDisplayValues();
@@ -113,10 +110,10 @@ function refreshDocFromSheet_(documentId, spreadsheetId, projectName) {
   }
 
   var doc = DocumentApp.openById(documentId);
-  replaceBetweenMarkers_(doc, HOURS_START, HOURS_END, hoursLines.join('\n'));
+  replaceSectionBody_(doc, HOURS_START, [CHART_START, ACTIVITY_START, LEGACY_HEADING], hoursLines.join('\n'));
   ensureChartMarkers_(doc);
   syncCategoryChartImage_(doc, dashboard);
-  replaceBetweenMarkers_(doc, ACTIVITY_START, ACTIVITY_END, activityLines.join('\n'));
+  replaceSectionBody_(doc, ACTIVITY_START, [LEGACY_HEADING], activityLines.join('\n'));
 
   return {
     projectName: projectName,
@@ -133,15 +130,15 @@ function ensureChartMarkers_(doc) {
   if (text.indexOf(CHART_START) >= 0) {
     return;
   }
-  var hoursEndSearch = body.findText(HOURS_END);
-  if (!hoursEndSearch) {
+  var activitySearch = body.findText(ACTIVITY_START);
+  if (!activitySearch) {
     return;
   }
-  var hoursEndPara = hoursEndSearch.getElement().getParent();
-  var idx = body.getChildIndex(hoursEndPara);
-  body.insertParagraph(idx + 1, CHART_START);
-  body.insertParagraph(idx + 2, '(Actual vs Estimate chart syncs from the Sheet Dashboard.)');
-  body.insertParagraph(idx + 3, CHART_END);
+  var activityPara = activitySearch.getElement().getParent();
+  var idx = body.getChildIndex(activityPara);
+  body.insertParagraph(idx, CHART_START);
+  body.insertParagraph(idx + 1, '(Actual vs Estimate chart syncs from the Sheet Dashboard.)');
+  body.insertParagraph(idx + 2, '');
 }
 
 function syncCategoryChartImage_(doc, dashboard) {
@@ -170,7 +167,7 @@ function syncCategoryChartImage_(doc, dashboard) {
   var imageBlob = slide.insertSheetsChartAsImage(chart).getAs('image/png');
   DriveApp.getFileById(temp.getId()).setTrashed(true);
 
-  // Clear content between chart markers, then insert image.
+  // Clear content after Category Chart until Detailed Activity Log, then insert image.
   var body = doc.getBody();
   var collecting = false;
   var toDelete = [];
@@ -188,7 +185,10 @@ function syncCategoryChartImage_(doc, dashboard) {
       insertAfter = child;
       continue;
     }
-    if (collecting && childText.indexOf(CHART_END) >= 0) {
+    if (collecting && (
+      childText.indexOf(ACTIVITY_START) >= 0 ||
+      childText.indexOf(LEGACY_HEADING) >= 0
+    )) {
       break;
     }
     if (collecting) {
@@ -204,44 +204,37 @@ function syncCategoryChartImage_(doc, dashboard) {
   }
 }
 
-function replaceBetweenMarkers_(doc, startMarker, endMarker, replacementText) {
-  var body = doc.getBody();
-  var text = body.getText();
-  var start = text.indexOf(startMarker);
-  var end = text.indexOf(endMarker);
-  if (start < 0 || end < 0 || end <= start) {
-    throw new Error('Markers not found: ' + startMarker + ' / ' + endMarker);
+function childMatchesAnyMarker_(childText, markers) {
+  for (var i = 0; i < markers.length; i++) {
+    if (childText.indexOf(markers[i]) >= 0) {
+      return true;
+    }
   }
+  return false;
+}
 
-  // Body find/replace by deleting the range between markers and inserting fresh text.
-  var rangeStart = start + startMarker.length;
+function replaceSectionBody_(doc, startMarker, untilMarkers, replacementText) {
+  var body = doc.getBody();
   var search = body.findText(startMarker);
   if (!search) {
     throw new Error('Could not locate start marker element: ' + startMarker);
   }
-  var startEl = search.getElement();
 
-  // Prefer a paragraph-based rewrite for reliability.
-  var startPara = startEl.getParent();
   var collecting = false;
   var toDelete = [];
   for (var i = 0; i < body.getNumChildren(); i++) {
     var child = body.getChild(i);
     var childText = '';
     try {
-      childText = child.asText().getText();
+      childText = child.asParagraph().getText();
     } catch (ignore) {
-      try {
-        childText = child.asParagraph().getText();
-      } catch (ignore2) {
-        childText = '';
-      }
+      childText = '';
     }
     if (childText.indexOf(startMarker) >= 0) {
       collecting = true;
       continue;
     }
-    if (collecting && childText.indexOf(endMarker) >= 0) {
+    if (collecting && childMatchesAnyMarker_(childText, untilMarkers)) {
       break;
     }
     if (collecting) {
@@ -252,7 +245,6 @@ function replaceBetweenMarkers_(doc, startMarker, endMarker, replacementText) {
     toDelete[d].removeFromParent();
   }
 
-  // Insert replacement immediately after the start-marker paragraph.
   var insertAfter = null;
   for (var j = 0; j < body.getNumChildren(); j++) {
     var c = body.getChild(j);
