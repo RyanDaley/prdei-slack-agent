@@ -754,11 +754,11 @@ def sync_sheet_sections_into_doc(
         hours_lines.append("(none this week)")
     
 
-    activity_lines = ["Timestamp | User | Hours | Category | Activity"]
+    activity_lines = ["Timestamp | User | Hours | Task | Category | Activity"]
     for entry in entries:
         activity_lines.append(
             f"{entry.timestamp_str} | {entry.user} | {entry.hours:g} | "
-            f"{entry.category_label} | {entry.activity}"
+            f"{entry.task_label or '-'} | {entry.category_label} | {entry.activity}"
         )
     if len(activity_lines) == 1:
         activity_lines.append("(no entries this week)")

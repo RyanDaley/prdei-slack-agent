@@ -37,6 +37,7 @@ ACTIVITY_HEADERS = [
     "Timestamp",
     "User",
     "Hours",
+    "Task",
     "Category",
     "Activity",
     "WeekStart",
@@ -70,7 +71,7 @@ def _category_labels() -> list[str]:
 def _write_headers_and_dashboard(sheets, spreadsheet_id: str) -> None:
     sheets.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id,
-        range=f"{ACTIVITY_TAB}!A1:F1",
+        range=f"{ACTIVITY_TAB}!A1:G1",
         valueInputOption="RAW",
         body={"values": [ACTIVITY_HEADERS]},
     ).execute()
@@ -78,7 +79,7 @@ def _write_headers_and_dashboard(sheets, spreadsheet_id: str) -> None:
     dashboard_top = [
         ["Week Start", ""],
         ["Week Of", ""],
-        ["Total Hours", f"=IFERROR(SUMIF({ACTIVITY_TAB}!F:F,B1,{ACTIVITY_TAB}!C:C),0)"],
+        ["Total Hours", f"=IFERROR(SUMIF({ACTIVITY_TAB}!G:G,B1,{ACTIVITY_TAB}!C:C),0)"],
         [""],
         ["Hours by Category (edit Estimate column manually)", ""],
     ]
@@ -124,8 +125,8 @@ def ensure_category_estimate_table(sheets, spreadsheet_id: str) -> None:
         row_num = CATEGORY_HEADER_ROW + 1 + offset
         actual_formula = (
             f"=IFERROR(SUMIFS({ACTIVITY_TAB}!C:C,"
-            f"{ACTIVITY_TAB}!D:D,A{row_num},"
-            f"{ACTIVITY_TAB}!F:F,$B$1),0)"
+            f"{ACTIVITY_TAB}!E:E,A{row_num},"
+            f"{ACTIVITY_TAB}!G:G,$B$1),0)"
         )
         rows.append([label, actual_formula, prior_estimates.get(label, "")])
 
@@ -292,6 +293,78 @@ def ensure_category_bar_chart(sheets, spreadsheet_id: str) -> int:
     return int(chart_id)
 
 
+def _activity_sheet_id(sheets, spreadsheet_id: str) -> int:
+    meta = (
+        sheets.spreadsheets()
+        .get(spreadsheetId=spreadsheet_id, fields="sheets(properties)")
+        .execute()
+    )
+    for sheet in meta.get("sheets", []):
+        props = sheet.get("properties", {})
+        if props.get("title") == ACTIVITY_TAB:
+            return int(props["sheetId"])
+    raise ValueError(f"Tab {ACTIVITY_TAB!r} not found")
+
+
+def _ensure_activity_headers(sheets, spreadsheet_id: str) -> None:
+    """
+    Ensure ActivityLog headers include Task (before Category).
+    Migrates older 6-column layouts by inserting a Task column at D.
+    """
+    header_row = (
+        sheets.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range=f"{ACTIVITY_TAB}!A1:G1")
+        .execute()
+        .get("values")
+        or []
+    )
+    header = header_row[0] if header_row else []
+    if header == ACTIVITY_HEADERS:
+        return
+
+    has_task = "Task" in header
+    has_category = "Category" in header
+    if has_category and not has_task:
+        sheet_id = _activity_sheet_id(sheets, spreadsheet_id)
+        sheets.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "requests": [
+                    {
+                        "insertDimension": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "dimension": "COLUMNS",
+                                "startIndex": 3,
+                                "endIndex": 4,
+                            },
+                            "inheritFromBefore": False,
+                        }
+                    }
+                ]
+            },
+        ).execute()
+        print("  [SHEETS] Inserted Task column into ActivityLog")
+
+    sheets.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=f"{ACTIVITY_TAB}!A1:G1",
+        valueInputOption="RAW",
+        body={"values": [ACTIVITY_HEADERS]},
+    ).execute()
+    sheets.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=f"{DASHBOARD_TAB}!B3",
+        valueInputOption="USER_ENTERED",
+        body={
+            "values": [
+                [f"=IFERROR(SUMIF({ACTIVITY_TAB}!G:G,B1,{ACTIVITY_TAB}!C:C),0)"]
+            ]
+        },
+    ).execute()
+
+
 def ensure_spreadsheet(project_name: str, spreadsheet_id: str = "") -> str:
     """
     Ensure ActivityLog + Dashboard tabs/formulas/chart exist.
@@ -308,7 +381,7 @@ def ensure_spreadsheet(project_name: str, spreadsheet_id: str = "") -> str:
     header = (
         sheets.spreadsheets()
         .values()
-        .get(spreadsheetId=spreadsheet_id, range=f"{ACTIVITY_TAB}!A1:F1")
+        .get(spreadsheetId=spreadsheet_id, range=f"{ACTIVITY_TAB}!A1:G1")
         .execute()
         .get("values")
         or []
@@ -316,6 +389,7 @@ def ensure_spreadsheet(project_name: str, spreadsheet_id: str = "") -> str:
     if not header:
         _write_headers_and_dashboard(sheets, spreadsheet_id)
     else:
+        _ensure_activity_headers(sheets, spreadsheet_id)
         ensure_category_estimate_table(sheets, spreadsheet_id)
     ensure_category_bar_chart(sheets, spreadsheet_id)
     return spreadsheet_id
@@ -364,6 +438,7 @@ def append_log_entries(
                 entry.timestamp_str,
                 entry.user,
                 entry.hours,
+                entry.task_label,
                 entry.category_label,
                 entry.activity,
                 week_start_date,
@@ -372,7 +447,7 @@ def append_log_entries(
 
     sheets.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
-        range=f"{ACTIVITY_TAB}!A:F",
+        range=f"{ACTIVITY_TAB}!A:G",
         valueInputOption="USER_ENTERED",
         insertDataOption="INSERT_ROWS",
         body={"values": rows},
@@ -390,17 +465,31 @@ def read_week_entries(
     if week_start is None or week_end is None:
         week_start, week_end, _ = jm.get_current_week_range()
 
+    header_result = (
+        sheets.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range=f"{ACTIVITY_TAB}!A1:G1")
+        .execute()
+    )
+    header = (header_result.get("values") or [[]])[0]
+    has_task_col = "Task" in header
+
     result = (
         sheets.spreadsheets()
         .values()
-        .get(spreadsheetId=spreadsheet_id, range=f"{ACTIVITY_TAB}!A2:F")
+        .get(spreadsheetId=spreadsheet_id, range=f"{ACTIVITY_TAB}!A2:G")
         .execute()
     )
     values = result.get("values") or []
     entries: list[jm.LogEntry] = []
     for row in values:
-        padded = list(row) + [""] * (6 - len(row))
-        timestamp_raw, user, hours_raw, category, activity, _week = padded[:6]
+        padded = list(row) + [""] * (7 - len(row))
+        if has_task_col:
+            timestamp_raw, user, hours_raw, task, category, activity, _week = padded[:7]
+        else:
+            # Legacy: Timestamp, User, Hours, Category, Activity, WeekStart
+            timestamp_raw, user, hours_raw, category, activity, _week = padded[:6]
+            task = ""
         try:
             timestamp = datetime.strptime(timestamp_raw.strip(), "%Y-%m-%d %I:%M %p")
             timestamp = timestamp.replace(tzinfo=ZoneInfo(jm.JOURNAL_TIMEZONE))
@@ -412,6 +501,7 @@ def read_week_entries(
                 timestamp=timestamp,
                 user=str(user).strip(),
                 hours=hours,
+                task=jm.normalize_task_key(str(task)),
                 category=jm.normalize_category_key(str(category)),
                 activity=str(activity).strip(),
             )

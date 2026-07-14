@@ -22,6 +22,14 @@ DURATION_ROW_COUNTS = {
     "0.25": 4,
 }
 
+# High-level project phase (months-long). Higher level than Category.
+TASK_LABELS = {
+    "project_management": "Project Management",
+    "schematic_design": "Schematic Design",
+    "design_development": "Design Development",
+    "construction_documents": "Construction Documents",
+}
+
 TASK_CATEGORY_LABELS = {
     "cad_modeling": "CAD / BIM Modeling",
     "permitting": "Permitting / Code Review",
@@ -37,10 +45,17 @@ class LogEntry:
     category: str
     activity: str
     project_key: str = ""
+    task: str = ""
 
     @property
     def timestamp_str(self) -> str:
         return self.timestamp.strftime("%Y-%m-%d %I:%M %p")
+
+    @property
+    def task_label(self) -> str:
+        if not self.task:
+            return ""
+        return TASK_LABELS.get(self.task, self.task.replace("_", " ").title())
 
     @property
     def category_label(self) -> str:
@@ -50,7 +65,7 @@ class LogEntry:
         activity = self.activity.replace("\n", " ").strip()
         return (
             f"ENTRY|{self.timestamp_str}|{self.user}|{self.hours}|"
-            f"{self.category}|{activity}\n"
+            f"{self.task}|{self.category}|{activity}\n"
         )
 
     def to_dict(self) -> dict:
@@ -58,6 +73,8 @@ class LogEntry:
             "timestamp": self.timestamp_str,
             "user": self.user,
             "hours": self.hours,
+            "task": self.task_label,
+            "task_key": self.task,
             "category": self.category_label,
             "category_key": self.category,
             "activity": self.activity,
@@ -70,25 +87,57 @@ def parse_log_line(line: str) -> Optional[LogEntry]:
     if not stripped.startswith("ENTRY|"):
         return None
 
-    parts = stripped.split("|", 5)
+    # New: ENTRY|ts|user|hours|task|category|activity
+    # Legacy: ENTRY|ts|user|hours|category|activity
+    parts = stripped.split("|")
     if len(parts) < 6:
         return None
 
-    _, timestamp_raw, user, hours_raw, category, activity = parts
     try:
-        timestamp = datetime.strptime(timestamp_raw.strip(), "%Y-%m-%d %I:%M %p")
+        timestamp = datetime.strptime(parts[1].strip(), "%Y-%m-%d %I:%M %p")
         timestamp = timestamp.replace(tzinfo=ZoneInfo(JOURNAL_TIMEZONE))
-        hours = float(hours_raw.strip())
+        # parts[0]=ENTRY, [1]=ts, [2]=user, [3]=hours, ...
+        hours = float(parts[3].strip())
     except (ValueError, TypeError):
         return None
 
+    user = parts[2].strip()
+    if len(parts) >= 7:
+        task = normalize_task_key(parts[4])
+        category = normalize_category_key(parts[5])
+        activity = "|".join(parts[6:]).strip()
+    else:
+        task = ""
+        category = normalize_category_key(parts[4])
+        activity = "|".join(parts[5:]).strip()
+
     return LogEntry(
         timestamp=timestamp,
-        user=user.strip(),
+        user=user,
         hours=hours,
-        category=normalize_category_key(category),
-        activity=activity.strip(),
+        task=task,
+        category=category,
+        activity=activity,
     )
+
+
+def normalize_task_key(task: str) -> str:
+    """Map stored task keys or display labels onto a canonical key."""
+    raw = (task or "").strip()
+    if not raw:
+        return raw
+    if raw in TASK_LABELS:
+        return raw
+
+    label_to_key = {label: key for key, label in TASK_LABELS.items()}
+    if raw in label_to_key:
+        return label_to_key[raw]
+
+    lowered = raw.lower()
+    for key, label in TASK_LABELS.items():
+        if key.lower() == lowered or label.lower() == lowered:
+            return key
+    return raw
 
 
 def normalize_category_key(category: str) -> str:
@@ -199,7 +248,8 @@ def build_fallback_summary(entries: list["LogEntry"]) -> dict:
     lines = []
     for entry in entries:
         lines.append(
-            f"- {entry.timestamp_str} ({entry.hours:g} hr, {entry.category_label}): "
+            f"- {entry.timestamp_str} ({entry.hours:g} hr, "
+            f"{entry.task_label or '-'}, {entry.category_label}): "
             f"{entry.activity}"
         )
     narrative = (

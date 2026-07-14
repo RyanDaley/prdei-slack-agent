@@ -10,6 +10,7 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 import agent_journal
+import agent_timesheets
 import hourly_reminder
 import journal_models as jm
 import project_router
@@ -29,6 +30,13 @@ BREAK_PROJECT_OPTION = {
 }
 
 TASK_OPTIONS = [
+    {"text": {"type": "plain_text", "text": "Project Management"}, "value": "project_management"},
+    {"text": {"type": "plain_text", "text": "Schematic Design"}, "value": "schematic_design"},
+    {"text": {"type": "plain_text", "text": "Design Development"}, "value": "design_development"},
+    {"text": {"type": "plain_text", "text": "Construction Documents"}, "value": "construction_documents"},
+]
+
+CATEGORY_OPTIONS = [
     {"text": {"type": "plain_text", "text": "CAD / BIM Modeling"}, "value": "cad_modeling"},
     {"text": {"type": "plain_text", "text": "Permitting / Code Review"}, "value": "permitting"},
     {"text": {"type": "plain_text", "text": "Engineering / Calcs"}, "value": "engineering"},
@@ -69,16 +77,17 @@ def _state_value(state: dict | None, block_id: str, action_id: str, field: str =
     return None
 
 
-def _entry_block_ids(row_index: int, side_by_side: bool) -> tuple[str, str, str]:
-    """Return (project_block_id, task_block_id, accomplishment_block_id)."""
+def _entry_block_ids(row_index: int, side_by_side: bool) -> tuple[str, str, str, str]:
+    """Return (project_block_id, task_block_id, category_block_id, accomplishment_block_id)."""
     accomplishment_block_id = f"entry_{row_index}_accomplishment_block"
     if side_by_side:
-        # Project + task share one actions block so Slack can render them horizontally.
+        # Project + Task + Category share one actions block (horizontal row).
         shared = f"entry_{row_index}_fields_block"
-        return shared, shared, accomplishment_block_id
+        return shared, shared, shared, accomplishment_block_id
     return (
         f"entry_{row_index}_project_block",
         f"entry_{row_index}_task_block",
+        f"entry_{row_index}_category_block",
         accomplishment_block_id,
     )
 
@@ -90,9 +99,12 @@ def _entry_row_blocks(
     *,
     side_by_side: bool = False,
 ) -> list[dict]:
-    project_block_id, task_block_id, accomplishment_block_id = _entry_block_ids(
-        row_index, side_by_side
-    )
+    (
+        project_block_id,
+        task_block_id,
+        category_block_id,
+        accomplishment_block_id,
+    ) = _entry_block_ids(row_index, side_by_side)
     project_options = _project_options(allow_break=side_by_side)
 
     project_element = {
@@ -104,8 +116,14 @@ def _entry_row_blocks(
     task_element = {
         "type": "static_select",
         "action_id": "task_select",
-        "placeholder": {"type": "plain_text", "text": "Select Task Type"},
+        "placeholder": {"type": "plain_text", "text": "Select a Task"},
         "options": TASK_OPTIONS,
+    }
+    category_element = {
+        "type": "static_select",
+        "action_id": "category_select",
+        "placeholder": {"type": "plain_text", "text": "Select a Category"},
+        "options": CATEGORY_OPTIONS,
     }
     accomplishment_element = {
         "type": "plain_text_input",
@@ -120,6 +138,9 @@ def _entry_row_blocks(
     saved_task = _state_value(
         preserve_state, task_block_id, "task_select", "selected_option"
     )
+    saved_category = _state_value(
+        preserve_state, category_block_id, "category_select", "selected_option"
+    )
     saved_accomplishment = _state_value(
         preserve_state, accomplishment_block_id, "accomplishment_input"
     )
@@ -129,9 +150,15 @@ def _entry_row_blocks(
         if matched:
             project_element["initial_option"] = matched
     if saved_task:
-        task_element["initial_option"] = next(
-            opt for opt in TASK_OPTIONS if opt["value"] == saved_task
+        matched_task = next((opt for opt in TASK_OPTIONS if opt["value"] == saved_task), None)
+        if matched_task:
+            task_element["initial_option"] = matched_task
+    if saved_category:
+        matched_cat = next(
+            (opt for opt in CATEGORY_OPTIONS if opt["value"] == saved_category), None
         )
+        if matched_cat:
+            category_element["initial_option"] = matched_cat
     if saved_accomplishment:
         accomplishment_element["initial_value"] = saved_accomplishment
 
@@ -150,7 +177,7 @@ def _entry_row_blocks(
             {
                 "type": "actions",
                 "block_id": project_block_id,
-                "elements": [project_element, task_element],
+                "elements": [project_element, task_element, category_element],
             }
         )
     else:
@@ -166,7 +193,13 @@ def _entry_row_blocks(
                     "type": "input",
                     "block_id": task_block_id,
                     "element": task_element,
-                    "label": {"type": "plain_text", "text": "Task Category"},
+                    "label": {"type": "plain_text", "text": "Task"},
+                },
+                {
+                    "type": "input",
+                    "block_id": category_block_id,
+                    "element": category_element,
+                    "label": {"type": "plain_text", "text": "Category"},
                 },
             ]
         )
@@ -223,7 +256,7 @@ def build_logtime_modal(duration: str = "1.0", preserve_state: dict | None = Non
                         "text": (
                             "Choose *Break* on any unused slice — "
                             "Break entries are not written to the detailed activity log. "
-                            "Task and accomplishment are optional for Break."
+                            "Task, Category, and accomplishment are optional for Break."
                         ),
                     }
                 ],
@@ -266,12 +299,18 @@ def _parse_modal_submission(state_values: dict, user_name: str) -> tuple[list[jm
     break_hours = 0.0
 
     for row_index in range(row_count):
-        project_block_id, task_block_id, accomplishment_block_id = _entry_block_ids(
-            row_index, side_by_side
-        )
+        (
+            project_block_id,
+            task_block_id,
+            category_block_id,
+            accomplishment_block_id,
+        ) = _entry_block_ids(row_index, side_by_side)
 
         project_key = _state_value(state_values, project_block_id, "project_select", "selected_option")
-        task_category = _state_value(state_values, task_block_id, "task_select", "selected_option")
+        task_key = _state_value(state_values, task_block_id, "task_select", "selected_option")
+        category_key = _state_value(
+            state_values, category_block_id, "category_select", "selected_option"
+        )
         accomplishment = _state_value(state_values, accomplishment_block_id, "accomplishment_input")
 
         if not project_key:
@@ -290,8 +329,10 @@ def _parse_modal_submission(state_values: dict, user_name: str) -> tuple[list[jm
 
         if side_by_side:
             missing_fields = []
-            if not task_category:
+            if not task_key:
                 missing_fields.append("task")
+            if not category_key:
+                missing_fields.append("category")
             if not accomplishment or not accomplishment.strip():
                 missing_fields.append("accomplishment")
             # Slack only accepts view errors on input blocks, not actions blocks.
@@ -301,14 +342,25 @@ def _parse_modal_submission(state_values: dict, user_name: str) -> tuple[list[jm
                 )
                 continue
         else:
-            if not task_category:
-                errors[task_block_id] = "Select a task category."
+            if not task_key:
+                errors[task_block_id] = "Select a task."
+            if not category_key:
+                errors[category_block_id] = "Select a category."
             if not accomplishment or not accomplishment.strip():
                 errors[accomplishment_block_id] = "Describe what you accomplished."
-            if task_block_id in errors or accomplishment_block_id in errors:
+            if (
+                task_block_id in errors
+                or category_block_id in errors
+                or accomplishment_block_id in errors
+            ):
                 continue
 
-        if not task_category or not accomplishment or not accomplishment.strip():
+        if (
+            not task_key
+            or not category_key
+            or not accomplishment
+            or not accomplishment.strip()
+        ):
             continue
 
         entries.append(
@@ -316,7 +368,8 @@ def _parse_modal_submission(state_values: dict, user_name: str) -> tuple[list[jm
                 timestamp=now,
                 user=user_name,
                 hours=hours,
-                category=task_category,
+                task=task_key,
+                category=category_key,
                 activity=accomplishment.strip(),
                 project_key=project_key,
             )
@@ -444,6 +497,12 @@ def handle_task_select(ack):
     ack()
 
 
+@app.action("category_select")
+def handle_category_select(ack):
+    """No-op: actions-block selects must be acked to avoid Unhandled request."""
+    ack()
+
+
 @app.action("duration_select")
 def handle_duration_select(ack, body, client):
     ack()
@@ -458,6 +517,32 @@ def handle_duration_select(ack, body, client):
         hash=body["view"]["hash"],
         view=updated_view,
     )
+
+
+def _slack_employee_identity(client, user_id: str) -> tuple[str, str]:
+    """
+    Return (display_name, last_name) from Slack profile for timesheet headers/titles.
+    """
+    display = "Employee"
+    last_name = "Employee"
+    try:
+        info = client.users_info(user=user_id)
+        user_obj = (info or {}).get("user") or {}
+        profile = user_obj.get("profile") or {}
+        display = (
+            profile.get("real_name")
+            or user_obj.get("real_name")
+            or profile.get("display_name")
+            or user_obj.get("name")
+            or display
+        )
+        last_name = (profile.get("last_name") or "").strip()
+        if not last_name:
+            parts = str(display).strip().split()
+            last_name = parts[-1] if parts else "Employee"
+    except Exception as exc:
+        print(f"[SLACK WARNING] Could not resolve Slack profile for {user_id}: {exc}")
+    return display, last_name
 
 
 @app.view("logtime_modal")
@@ -537,6 +622,25 @@ def handle_logtime_submission(ack, body, client, view):
     metadata = json.loads(view.get("private_metadata") or "{}")
     channel_id = metadata.get("channel_id")
     user_id = user.get("id") or metadata.get("user_id")
+
+    if entries and user_id:
+        display_name, last_name = _slack_employee_identity(client, user_id)
+        ts_result = agent_timesheets.process_timesheet_update(
+            slack_user_id=user_id,
+            employee_display_name=display_name,
+            last_name=last_name,
+            entries=entries,
+        )
+        if ts_result.success:
+            results.append(
+                f"✅ Timesheet `{ts_result.spreadsheet_title}`: "
+                f"updated {ts_result.rows_touched} entr(y/ies)."
+            )
+        else:
+            results.append(
+                f"⚠️ Timesheet write failed: {ts_result.error_message or 'unknown error'}."
+            )
+
     message = "\n".join(results) if results else "No entries were processed."
     if user_id:
         try:

@@ -94,16 +94,23 @@ function refreshDocFromSheet_(documentId, spreadsheetId, projectName) {
   hoursLines.push('(Bar chart of Actual vs Estimate appears in the section below.)');
 
   var activityValues = activity.getDataRange().getDisplayValues();
-  var activityLines = ['Timestamp | User | Hours | Category | Activity'];
+  var activityLines = ['Timestamp | User | Hours | Task | Category | Activity'];
   for (var i = 1; i < activityValues.length; i++) {
     var row = activityValues[i];
-    var rowWeek = row[5] || '';
+    var rowWeek = row[6] || row[5] || '';
     if (weekStart && rowWeek && String(rowWeek) !== String(weekStart)) {
       continue; // current-week rows only
     }
-    activityLines.push(
-      [row[0], row[1], row[2], row[3], row[4]].join(' | ')
-    );
+    // Prefer Task+Category layout (A-F); fall back to legacy without Task.
+    if (row.length >= 6 && row[3] && row[4] !== undefined) {
+      activityLines.push(
+        [row[0], row[1], row[2], row[3], row[4], row[5]].join(' | ')
+      );
+    } else {
+      activityLines.push(
+        [row[0], row[1], row[2], '', row[3], row[4]].join(' | ')
+      );
+    }
   }
   if (activityLines.length === 1) {
     activityLines.push('(no entries this week)');
