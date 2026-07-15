@@ -184,7 +184,7 @@ def apply_document_heading_styles(document_id: str, service=None) -> tuple[int, 
     document = get_document(service, document_id)
     body_content = _collect_body_elements(document)
     h1_titles = {t.strip() for t in HEADING1_TITLES}
-    category_labels = set(jm.TASK_CATEGORY_LABELS.values())
+    category_labels = set(jm.category_labels_map().values())
     requests: list[dict] = []
     h1_count = 0
     bold_count = 0
@@ -631,7 +631,7 @@ def sync_category_chart_into_doc(
 
     category_rows = agent_sheets.get_dashboard_category_rows(spreadsheet_id, sheets=sheets)
     if not category_rows:
-        labels = list(jm.TASK_CATEGORY_LABELS.values())
+        labels = list(jm.category_labels_map().values())
         category_rows = [(label, 0.0, 0.0) for label in labels]
 
     png_bytes = agent_sheets.render_category_bar_chart_png(category_rows)

@@ -37,6 +37,38 @@ TASK_CATEGORY_LABELS = {
 }
 
 
+def _firestore_task_labels() -> dict[str, str]:
+    try:
+        import firestore_store
+
+        return {item.id: item.name for item in firestore_store.list_tasks()}
+    except Exception:
+        return {}
+
+
+def _firestore_category_labels() -> dict[str, str]:
+    try:
+        import firestore_store
+
+        return {item.id: item.name for item in firestore_store.list_categories()}
+    except Exception:
+        return {}
+
+
+def task_labels_map() -> dict[str, str]:
+    """Firestore tasks overlaying the seeded static map."""
+    merged = dict(TASK_LABELS)
+    merged.update(_firestore_task_labels())
+    return merged
+
+
+def category_labels_map() -> dict[str, str]:
+    """Firestore categories overlaying the seeded static map."""
+    merged = dict(TASK_CATEGORY_LABELS)
+    merged.update(_firestore_category_labels())
+    return merged
+
+
 @dataclass
 class LogEntry:
     timestamp: datetime
@@ -55,11 +87,13 @@ class LogEntry:
     def task_label(self) -> str:
         if not self.task:
             return ""
-        return TASK_LABELS.get(self.task, self.task.replace("_", " ").title())
+        labels = task_labels_map()
+        return labels.get(self.task, self.task.replace("_", " ").title())
 
     @property
     def category_label(self) -> str:
-        return TASK_CATEGORY_LABELS.get(self.category, self.category.replace("_", " ").title())
+        labels = category_labels_map()
+        return labels.get(self.category, self.category.replace("_", " ").title())
 
     def to_log_line(self) -> str:
         activity = self.activity.replace("\n", " ").strip()
@@ -126,15 +160,16 @@ def normalize_task_key(task: str) -> str:
     raw = (task or "").strip()
     if not raw:
         return raw
-    if raw in TASK_LABELS:
+    labels = task_labels_map()
+    if raw in labels:
         return raw
 
-    label_to_key = {label: key for key, label in TASK_LABELS.items()}
+    label_to_key = {label: key for key, label in labels.items()}
     if raw in label_to_key:
         return label_to_key[raw]
 
     lowered = raw.lower()
-    for key, label in TASK_LABELS.items():
+    for key, label in labels.items():
         if key.lower() == lowered or label.lower() == lowered:
             return key
     return raw
@@ -145,15 +180,16 @@ def normalize_category_key(category: str) -> str:
     raw = (category or "").strip()
     if not raw:
         return raw
-    if raw in TASK_CATEGORY_LABELS:
+    labels = category_labels_map()
+    if raw in labels:
         return raw
 
-    label_to_key = {label: key for key, label in TASK_CATEGORY_LABELS.items()}
+    label_to_key = {label: key for key, label in labels.items()}
     if raw in label_to_key:
         return label_to_key[raw]
 
     lowered = raw.lower()
-    for key, label in TASK_CATEGORY_LABELS.items():
+    for key, label in labels.items():
         if key.lower() == lowered or label.lower() == lowered:
             return key
     return raw

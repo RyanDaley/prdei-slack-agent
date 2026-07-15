@@ -90,13 +90,27 @@ def extract_id_from_url(input_string: str, kind: str = "folder") -> str:
 def get_folder_id_for_project(project_value: str) -> Optional[str]:
     import os
 
-    # Prefer Cloud Run env (survives image rollbacks from GitHub Cloud Build).
+    raw = ""
+    # 1) Firestore project record
+    try:
+        import firestore_store
+
+        record = firestore_store.get_project(project_value)
+        if record and record.drive_folder_url:
+            raw = record.drive_folder_url.strip()
+    except Exception as exc:
+        print(f"[ROUTER] Firestore project lookup failed for '{project_value}': {exc}", flush=True)
+
+    # 2) Cloud Run env (legacy fallback until full cutover)
     env_key = f"PROJECT_FOLDER_{project_value.upper()}"
-    raw = os.environ.get(env_key, "").strip() or PROJECT_DOC_MAP.get(project_value, "")
+    if not raw:
+        raw = os.environ.get(env_key, "").strip() or PROJECT_DOC_MAP.get(project_value, "")
+
     if not raw:
         print(
             f"[ROUTER ERROR] No Drive folder mapped for key '{project_value}'. "
-            f"Set {env_key} in env.yaml or PROJECT_DOC_MAP in project_router.py.",
+            f"Set drive_folder_url in Firestore, {env_key} in env.yaml, "
+            "or PROJECT_DOC_MAP in project_router.py.",
             flush=True,
         )
         return None
@@ -112,6 +126,15 @@ def get_folder_id_for_project(project_value: str) -> Optional[str]:
 
 
 def get_project_display_name(project_value: str) -> str:
+    try:
+        import firestore_store
+
+        record = firestore_store.get_project(project_value)
+        if record and record.name:
+            return record.name
+    except Exception as exc:
+        print(f"[ROUTER] Firestore display name lookup failed for '{project_value}': {exc}", flush=True)
+
     return PROJECT_DISPLAY_NAMES.get(
         project_value,
         project_value.replace("_", " ").title(),

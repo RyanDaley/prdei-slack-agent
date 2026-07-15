@@ -281,7 +281,8 @@ def build_logtime_modal(duration: str = "1.0", preserve_state: dict | None = Non
                 {
                     "type": "mrkdwn",
                     "text": (
-                        "Use *+* next to Project / Task / Category to create a new one."
+                        "Use *+* next to Project / Task / Category to create a new one. "
+                        "(Slack shows the description via accessibility label, not a hover tip.)"
                     ),
                 }
             ],
@@ -416,6 +417,7 @@ def _parent_metadata_from_view(view: dict) -> dict:
     except Exception:
         meta = {}
     meta["parent_view_id"] = view.get("id", "")
+    meta["parent_view_hash"] = view.get("hash", "")
     duration = _state_value(
         view.get("state", {}).get("values", {}),
         "duration_block",
@@ -423,7 +425,7 @@ def _parent_metadata_from_view(view: dict) -> dict:
         "selected_option",
     ) or "1.0"
     meta["duration"] = duration
-    # Do not store preserve_state — Slack private_metadata max is 3000 chars.
+    meta["preserve_state"] = view.get("state", {}).get("values", {})
     return meta
 
 
@@ -481,7 +483,9 @@ def _refresh_parent_logtime(client, parent_meta: dict) -> None:
     if not view_id:
         return
     duration = parent_meta.get("duration") or "1.0"
-    updated = build_logtime_modal(duration=duration)
+    preserve = parent_meta.get("preserve_state")
+    updated = build_logtime_modal(duration=duration, preserve_state=preserve)
+    # Keep original channel/user ids on the root modal.
     root_meta = {
         "channel_id": parent_meta.get("channel_id", ""),
         "user_id": parent_meta.get("user_id", ""),
@@ -732,60 +736,47 @@ def handle_create_project_modal(ack, body, client, view):
     link = drive_picker.picker_url(token)
     parent_meta = json.loads(view.get("private_metadata") or "{}")
 
-    blocks = [
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    f"✅ Created *{created.name}* (`{created.id}`).\n"
-                    "Next: choose its Google Drive folder (link expires in 15 minutes)."
-                ),
-            },
-        }
-    ]
-    if link.startswith("http"):
-        blocks.append(
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "Choose Drive folder"},
-                        "url": link,
-                        "action_id": "open_drive_picker_link",
-                    }
-                ],
-            }
-        )
-        blocks.append(
-            {
-                "type": "context",
-                "elements": [{"type": "mrkdwn", "text": f"Or open: `{link}`"}],
-            }
-        )
-    else:
-        blocks.append(
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": (
-                        "Set `SERVICE_PUBLIC_URL` to this Cloud Run service URL, then "
-                        "create the project again so the folder-picker button works.\n"
-                        f"Relative path would be: `{link}`"
-                    ),
-                },
-            }
-        )
-
     ack(
         response_action="update",
         view={
             "type": "modal",
             "title": {"type": "plain_text", "text": "Project created"},
             "close": {"type": "plain_text", "text": "Done"},
-            "blocks": blocks,
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            f"✅ Created *{created.name}* (`{created.id}`).\n"
+                            "Next: choose its Google Drive folder (link expires in 15 minutes)."
+                        ),
+                    },
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Choose Drive folder"},
+                            "url": link if link.startswith("http") else "https://example.com",
+                            "action_id": "open_drive_picker_link",
+                        }
+                    ],
+                },
+                {
+                    "type": "context",
+                    "elements": [
+                        {
+                            "type": "mrkdwn",
+                            "text": (
+                                f"If the button doesn't open: `{link}`\n"
+                                "Set `SERVICE_PUBLIC_URL` on Cloud Run if this is a relative path."
+                            ),
+                        }
+                    ],
+                },
+            ],
         },
     )
     _refresh_parent_logtime(client, parent_meta)
@@ -933,23 +924,7 @@ def handle_logtime_submission(ack, body, client, view):
 
 
 class HealthAndPickerServer(BaseHTTPRequestHandler):
-    def _maybe_remember_public_url(self):
-        """Learn Cloud Run public URL from inbound request Host header."""
-        if drive_picker.public_base_url():
-            return
-        host = (self.headers.get("Host") or "").strip()
-        if not host or host.startswith("localhost") or host.startswith("127."):
-            return
-        scheme = (
-            "https"
-            if "run.app" in host or self.headers.get("X-Forwarded-Proto") == "https"
-            else "http"
-        )
-        os.environ["SERVICE_PUBLIC_URL"] = f"{scheme}://{host}"
-        print(f"[PICKER] Learned SERVICE_PUBLIC_URL={os.environ['SERVICE_PUBLIC_URL']}", flush=True)
-
     def do_GET(self):
-        self._maybe_remember_public_url()
         parsed = urlparse(self.path)
         if parsed.path.startswith("/drive-picker/"):
             token = parsed.path.split("/drive-picker/", 1)[1].strip("/")
@@ -968,7 +943,6 @@ class HealthAndPickerServer(BaseHTTPRequestHandler):
         self.wfile.write(b"OK")
 
     def do_POST(self):
-        self._maybe_remember_public_url()
         parsed = urlparse(self.path)
         if parsed.path.startswith("/drive-picker/"):
             token = parsed.path.split("/drive-picker/", 1)[1].strip("/")

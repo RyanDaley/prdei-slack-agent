@@ -729,8 +729,8 @@ def upsert_timesheet_entry(
 def process_timesheet_update(
     slack_user_id: str,
     employee_display_name: str,
-    last_name: str,
     entries: list[jm.LogEntry],
+    last_name: str = "",
 ) -> TimesheetUpdateResult:
     """
     Write journal entries into this week's employee timesheet Sheet.
@@ -739,13 +739,14 @@ def process_timesheet_update(
         return TimesheetUpdateResult(success=True, error_message="No entries.")
 
     try:
-        assets = employee_router.ensure_employee_timesheet(slack_user_id, last_name)
+        title_name = employee_display_name or last_name or "Employee"
+        assets = employee_router.ensure_employee_timesheet(slack_user_id, title_name)
         if not assets:
             return TimesheetUpdateResult(
                 success=False,
                 error_message=(
                     "No employee timesheet Drive folder configured "
-                    f"(EMPLOYEE_FOLDER_{slack_user_id.upper()})."
+                    f"(Firestore User or EMPLOYEE_FOLDER_{slack_user_id.upper()})."
                 ),
             )
 

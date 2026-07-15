@@ -65,7 +65,7 @@ def _ensure_tab(sheets, spreadsheet_id: str, title: str) -> None:
 
 
 def _category_labels() -> list[str]:
-    return list(jm.TASK_CATEGORY_LABELS.values())
+    return list(jm.category_labels_map().values())
 
 
 def _write_headers_and_dashboard(sheets, spreadsheet_id: str) -> None:
