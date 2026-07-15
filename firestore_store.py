@@ -5,7 +5,7 @@ Collections (document ID = Slack-friendly key, except users use slack_user_id):
   projects/{id}     { name, drive_folder_url }
   tasks/{id}        { name }
   categories/{id}   { name }
-  users/{slack_id}  { slack_user_id, display_name, timesheet_folder_url, email }
+  users/{slack_id}  { slack_user_id, display_name, timesheet_folder_url, email, last_logtime? }
 
 Reads prefer Firestore; callers keep env.yaml / hardcoded maps as fallback.
 """
@@ -48,6 +48,20 @@ class UserRecord:
     display_name: str
     timesheet_folder_url: str = ""
     email: str = ""
+
+
+@dataclass
+class LastLogEntry:
+    project_key: str
+    task: str
+    category: str
+    activity: str
+
+
+@dataclass
+class LastLogtime:
+    duration: str
+    entries: list[LastLogEntry]
 
 
 def get_db() -> firestore.Client:
@@ -190,6 +204,88 @@ def upsert_user(
     }
     get_db().collection(COL_USERS).document(user_id).set(payload, merge=True)
     return UserRecord(**payload)
+
+
+def get_last_logtime(slack_user_id: str) -> Optional[LastLogtime]:
+    """Return the user's most recent successful /logtime submission, if any."""
+    user_id = (slack_user_id or "").strip()
+    if not user_id:
+        return None
+    snap = get_db().collection(COL_USERS).document(user_id).get()
+    if not snap.exists:
+        return None
+    data = (snap.to_dict() or {}).get("last_logtime") or {}
+    raw_entries = data.get("entries") or []
+    if not isinstance(raw_entries, list) or not raw_entries:
+        return None
+    entries: list[LastLogEntry] = []
+    for item in raw_entries:
+        if not isinstance(item, dict):
+            continue
+        project_key = str(item.get("project_key") or "").strip()
+        if not project_key:
+            continue
+        entries.append(
+            LastLogEntry(
+                project_key=project_key,
+                task=str(item.get("task") or "").strip(),
+                category=str(item.get("category") or "").strip(),
+                activity=str(item.get("activity") or "").strip(),
+            )
+        )
+    if not entries:
+        return None
+    duration = str(data.get("duration") or "1.0").strip() or "1.0"
+    return LastLogtime(duration=duration, entries=entries)
+
+
+def set_last_logtime(
+    slack_user_id: str,
+    duration: str,
+    entries: list[LastLogEntry] | list[dict],
+) -> None:
+    """
+    Persist the last /logtime form for prefill on the next open.
+    Creates/merges the user document if needed (does not require prior User seed).
+    """
+    user_id = (slack_user_id or "").strip()
+    if not user_id or not entries:
+        return
+    serialized = []
+    for item in entries:
+        if isinstance(item, LastLogEntry):
+            serialized.append(
+                {
+                    "project_key": item.project_key,
+                    "task": item.task,
+                    "category": item.category,
+                    "activity": item.activity,
+                }
+            )
+        elif isinstance(item, dict):
+            project_key = str(item.get("project_key") or "").strip()
+            if not project_key:
+                continue
+            serialized.append(
+                {
+                    "project_key": project_key,
+                    "task": str(item.get("task") or "").strip(),
+                    "category": str(item.get("category") or "").strip(),
+                    "activity": str(item.get("activity") or "").strip(),
+                }
+            )
+    if not serialized:
+        return
+    get_db().collection(COL_USERS).document(user_id).set(
+        {
+            "slack_user_id": user_id,
+            "last_logtime": {
+                "duration": (duration or "1.0").strip() or "1.0",
+                "entries": serialized,
+            },
+        },
+        merge=True,
+    )
 
 
 def collection_is_empty(collection: str) -> bool:

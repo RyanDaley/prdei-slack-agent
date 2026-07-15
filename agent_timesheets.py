@@ -12,6 +12,7 @@ Mirrors the legacy Excel layout:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
@@ -131,43 +132,48 @@ def _timesheet_sheet_id(sheets, spreadsheet_id: str) -> int:
     raise ValueError(f"Tab {TIMESHEET_TAB!r} not found")
 
 
-def _apply_timesheet_formatting(sheets, spreadsheet_id: str) -> None:
+def _apply_timesheet_formatting(
+    sheets,
+    spreadsheet_id: str,
+    *,
+    include_starter_widths: bool = False,
+) -> None:
     """
-    Set starter column widths and wrap Activity text so newlines show.
-    Call _autosize_timesheet_columns after the first data row exists.
+    Apply wrap / bold / alignment. Optionally set starter column widths
+    (only when first creating the sheet — later writes use autosize).
     """
     sheet_id = _timesheet_sheet_id(sheets, spreadsheet_id)
-    # Starter widths for an empty / header-only sheet (before first entry).
-    widths_px = [
-        160,  # Project
-        180,  # Task
-        160,  # Category
-        360,  # Activity
-        56,   # Sun
-        56,   # Mon
-        56,   # Tue
-        56,   # Wed
-        64,   # Thurs
-        56,   # Fri
-        56,   # Sat
-        64,   # Total
-    ]
     requests = []
-    for index, pixel_size in enumerate(widths_px):
-        requests.append(
-            {
-                "updateDimensionProperties": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "dimension": "COLUMNS",
-                        "startIndex": index,
-                        "endIndex": index + 1,
-                    },
-                    "properties": {"pixelSize": pixel_size},
-                    "fields": "pixelSize",
+    if include_starter_widths:
+        widths_px = [
+            160,  # Project
+            180,  # Task
+            160,  # Category
+            360,  # Activity
+            56,   # Sun
+            56,   # Mon
+            56,   # Tue
+            56,   # Wed
+            64,   # Thurs
+            56,   # Fri
+            56,   # Sat
+            64,   # Total
+        ]
+        for index, pixel_size in enumerate(widths_px):
+            requests.append(
+                {
+                    "updateDimensionProperties": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "dimension": "COLUMNS",
+                            "startIndex": index,
+                            "endIndex": index + 1,
+                        },
+                        "properties": {"pixelSize": pixel_size},
+                        "fields": "pixelSize",
+                    }
                 }
-            }
-        )
+            )
     # Wrap Activity column (D = index 3) so each logged line appears on its own row visually.
     requests.append(
         {
@@ -280,8 +286,10 @@ def _autosize_timesheet_columns(
     padding_px: int = 24,
 ) -> None:
     """
-    Resize each Timesheet column to fit the longest cell text, then add padding.
-    Sheets autoResize has no padding option, so we bump pixelSize afterward.
+    Resize each Timesheet column to fit the longest visible text after a write.
+
+    Uses Sheets autoResize, then also sizes from cell content so wrap/newlines
+    and API lag don't leave columns too narrow after a new entry.
     """
     sheet_id = _timesheet_sheet_id(sheets, spreadsheet_id)
     sheets.spreadsheets().batchUpdate(
@@ -302,29 +310,34 @@ def _autosize_timesheet_columns(
         },
     ).execute()
 
-    meta = (
+    # Content-aware pass: longest line per column (Activity can have newlines).
+    values = (
         sheets.spreadsheets()
+        .values()
         .get(
             spreadsheetId=spreadsheet_id,
-            ranges=[f"{TIMESHEET_TAB}!A1:L1"],
-            fields="sheets(properties(sheetId,title),data(columnMetadata(pixelSize)))",
+            range=f"{TIMESHEET_TAB}!A2:L",
+            valueRenderOption="FORMATTED_VALUE",
         )
         .execute()
+        .get("values")
+        or []
     )
-    column_meta = []
-    for sheet in meta.get("sheets", []):
-        if sheet.get("properties", {}).get("sheetId") != sheet_id:
-            continue
-        data = sheet.get("data") or []
-        if data:
-            column_meta = data[0].get("columnMetadata") or []
-        break
+    # Approx px/char for Sheets default font; Activity capped so wrap can work.
+    px_per_char = 7.2
+    floors = [80, 80, 80, 160, 48, 48, 48, 48, 56, 48, 48, 56]
+    ceilings = [280, 280, 240, 480, 90, 90, 90, 90, 96, 90, 90, 96]
+    max_lens = [0] * 12
+    for row in values:
+        padded = list(row) + [""] * (12 - len(row))
+        for col_idx, cell in enumerate(padded[:12]):
+            for line in str(cell or "").replace("\r\n", "\n").split("\n"):
+                max_lens[col_idx] = max(max_lens[col_idx], len(line.strip()))
 
     pad_requests = []
-    for index, col in enumerate(column_meta[:12]):
-        current = int(col.get("pixelSize") or 0)
-        # Keep a small floor so empty day columns stay usable.
-        new_size = max(current + padding_px, 40)
+    for index, longest in enumerate(max_lens):
+        content_px = int(longest * px_per_char) + padding_px
+        new_size = max(floors[index], min(ceilings[index], content_px))
         pad_requests.append(
             {
                 "updateDimensionProperties": {
@@ -340,14 +353,14 @@ def _autosize_timesheet_columns(
             }
         )
 
-    if pad_requests:
-        sheets.spreadsheets().batchUpdate(
-            spreadsheetId=spreadsheet_id,
-            body={"requests": pad_requests},
-        ).execute()
+    sheets.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"requests": pad_requests},
+    ).execute()
     print(
         f"  [TIMESHEET] Auto-sized columns to longest cell content "
-        f"(+{padding_px}px padding)"
+        f"(+{padding_px}px padding)",
+        flush=True,
     )
 
 
@@ -420,8 +433,11 @@ def ensure_timesheet_layout(
             body={"values": headers},
         ).execute()
         print(f"  [TIMESHEET] Initialized layout on {spreadsheet_id}")
-
-    _apply_timesheet_formatting(sheets, spreadsheet_id)
+        _apply_timesheet_formatting(
+            sheets, spreadsheet_id, include_starter_widths=True
+        )
+    else:
+        _apply_timesheet_formatting(sheets, spreadsheet_id)
 
 
 def _read_data_rows(sheets, spreadsheet_id: str) -> list[list]:
@@ -467,6 +483,12 @@ def _format_hours_label(hours: float) -> str:
     return f"{float(hours):g} hr"
 
 
+_ACTIVITY_LINE_RE = re.compile(
+    r"^(?P<day>\w+):\s+(?P<hours>[0-9]*\.?[0-9]+)\s*hr"
+    r"(?:\s+[—\-]\s+(?P<text>.*))?$"
+)
+
+
 def _activity_append(
     existing: str,
     when: datetime,
@@ -474,19 +496,53 @@ def _activity_append(
     hours: float,
 ) -> str:
     """
-    Append a new log line to Activity. Each Slack submission becomes its own line
-    and includes how much time was spent.
+    Build Activity text for a Project/Task/Category row.
+
+    Same weekday as the previous line (same task row): update that line — bump
+    hours and append new accomplishment text with a comma (no repeated day).
+    Different weekday: start a new line.
     """
     snippet = (new_text or "").strip()
+    day = _day_label(when)
     hours_label = _format_hours_label(hours)
     if snippet:
-        line = f"{_day_label(when)}: {hours_label} — {snippet}"
+        line = f"{day}: {hours_label} — {snippet}"
     else:
-        line = f"{_day_label(when)}: {hours_label}"
+        line = f"{day}: {hours_label}"
+
     existing = (existing or "").replace("\r\n", "\n").replace("\r", "\n").rstrip()
     if not existing:
         return line
-    return f"{existing}\n{line}"
+
+    lines = existing.split("\n")
+    last = lines[-1].strip()
+    match = _ACTIVITY_LINE_RE.match(last)
+    if not (match and match.group("day") == day):
+        return f"{existing}\n{line}"
+
+    try:
+        prior_hours = float(match.group("hours"))
+    except (TypeError, ValueError):
+        prior_hours = 0.0
+    total = round(prior_hours + float(hours), 2)
+    total_label = _format_hours_label(total)
+    prior_text = (match.group("text") or "").strip()
+
+    if not snippet:
+        merged_text = prior_text
+    elif not prior_text:
+        merged_text = snippet
+    elif prior_text.lower() == snippet.lower():
+        # Identical accomplishment — keep one copy, just roll up hours.
+        merged_text = prior_text
+    else:
+        merged_text = f"{prior_text}, {snippet}"
+
+    if merged_text:
+        lines[-1] = f"{day}: {total_label} — {merged_text}"
+    else:
+        lines[-1] = f"{day}: {total_label}"
+    return "\n".join(lines)
 
 
 def _row_number_for_index(idx: int) -> int:
@@ -518,7 +574,7 @@ def _last_project_sheet_row(sheets, spreadsheet_id: str) -> int | None:
 def _refresh_totals_row(sheets, spreadsheet_id: str) -> None:
     """
     Place a Total row 3 rows below the last project row.
-    Top border across A:L; SUM formulas for day columns and Total.
+    Clear stale borders from the data area, then top-border only the Total row.
     """
     last_project = _last_project_sheet_row(sheets, spreadsheet_id)
     if last_project is None:
@@ -567,11 +623,40 @@ def _refresh_totals_row(sheets, spreadsheet_id: str) -> None:
         body={"values": values},
     ).execute()
 
-    # Bold only the "Total" label in column A; keep E–L numeric cells not bold.
+    # Strip any leftover borders from earlier Total positions (values clear does not
+    # remove cell format), then put a top border only on the current Total row.
+    no_border = {"style": "NONE"}
     sheets.spreadsheets().batchUpdate(
         spreadsheetId=spreadsheet_id,
         body={
             "requests": [
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": DATA_START_ROW - 1,
+                            "endRowIndex": total_row + 5,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": 12,
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "borders": {
+                                    "top": no_border,
+                                    "bottom": no_border,
+                                    "left": no_border,
+                                    "right": no_border,
+                                }
+                            }
+                        },
+                        "fields": (
+                            "userEnteredFormat.borders.top,"
+                            "userEnteredFormat.borders.bottom,"
+                            "userEnteredFormat.borders.left,"
+                            "userEnteredFormat.borders.right"
+                        ),
+                    }
+                },
                 {
                     "repeatCell": {
                         "range": {

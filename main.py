@@ -102,11 +102,59 @@ def _create_plus_button(action_id: str, value: str, accessibility_label: str) ->
 
 
 def _open_logtime_modal(client, trigger_id: str, channel_id: str, user_id: str):
-    modal = build_logtime_modal()
+    duration = "1.0"
+    preserve_state = None
+    try:
+        last = firestore_store.get_last_logtime(user_id)
+        if last and last.entries:
+            duration, preserve_state = _preserve_state_from_last_logtime(last)
+            print(
+                f"[SLACK] Prefilling logtime for {user_id} "
+                f"from last entry ({len(last.entries)} row(s), {duration} hr).",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"[SLACK WARNING] Could not load last logtime for {user_id}: {exc}", flush=True)
+
+    modal = build_logtime_modal(duration=duration, preserve_state=preserve_state)
     modal["private_metadata"] = json.dumps(
         {"channel_id": channel_id, "user_id": user_id}
     )
     client.views_open(trigger_id=trigger_id, view=modal)
+
+
+def _preserve_state_from_last_logtime(last: firestore_store.LastLogtime) -> tuple[str, dict]:
+    """
+    Build Slack-shaped preserve_state so build_logtime_modal can set
+    initial_option / initial_value from the previous submission.
+    """
+    duration = last.duration if last.duration in jm.DURATION_ROW_COUNTS else "1.0"
+    max_rows = jm.DURATION_ROW_COUNTS.get(duration, 1)
+    state: dict = {}
+    for row_index, entry in enumerate(last.entries[:max_rows]):
+        (
+            project_block_id,
+            task_block_id,
+            category_block_id,
+            accomplishment_block_id,
+        ) = _entry_block_ids(row_index)
+        if entry.project_key:
+            state[project_block_id] = {
+                "project_select": {"selected_option": {"value": entry.project_key}}
+            }
+        if entry.task:
+            state[task_block_id] = {
+                "task_select": {"selected_option": {"value": entry.task}}
+            }
+        if entry.category:
+            state[category_block_id] = {
+                "category_select": {"selected_option": {"value": entry.category}}
+            }
+        if entry.activity:
+            state[accomplishment_block_id] = {
+                "accomplishment_input": {"value": entry.activity}
+            }
+    return duration, state
 
 
 def _state_value(state: dict | None, block_id: str, action_id: str, field: str = "value"):
@@ -840,9 +888,36 @@ def handle_logtime_submission(ack, body, client, view):
 
     ack()
 
+    duration = (
+        _state_value(state_values, "duration_block", "duration_select", "selected_option")
+        or "1.0"
+    )
+
     entries_by_project: dict[str, list[jm.LogEntry]] = defaultdict(list)
     for entry in entries:
         entries_by_project[entry.project_key].append(entry)
+
+    metadata = json.loads(view.get("private_metadata") or "{}")
+    channel_id = metadata.get("channel_id")
+    user_id = user.get("id") or metadata.get("user_id")
+
+    if entries and user_id:
+        try:
+            firestore_store.set_last_logtime(
+                user_id,
+                duration,
+                [
+                    firestore_store.LastLogEntry(
+                        project_key=entry.project_key,
+                        task=entry.task,
+                        category=entry.category,
+                        activity=entry.activity,
+                    )
+                    for entry in entries
+                ],
+            )
+        except Exception as exc:
+            print(f"[SLACK WARNING] Could not save last logtime for {user_id}: {exc}", flush=True)
 
     total_hours = round(sum(entry.hours for entry in entries), 2)
     print(
@@ -899,10 +974,6 @@ def handle_logtime_submission(ack, body, client, view):
         results.append(
             f"☕ Break: {break_hours:g} hr skipped (not written to the detailed activity log)."
         )
-
-    metadata = json.loads(view.get("private_metadata") or "{}")
-    channel_id = metadata.get("channel_id")
-    user_id = user.get("id") or metadata.get("user_id")
 
     if entries and user_id:
         display_name, _last_name = _slack_employee_identity(client, user_id)

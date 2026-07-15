@@ -425,33 +425,120 @@ def append_log_entries(
     entries: list[jm.LogEntry],
     sheets=None,
 ) -> bool:
+    """
+    Write ActivityLog rows. If a row this week already matches
+    (user + task + category + activity text), add hours to that row instead
+    of inserting a duplicate.
+    """
     if not entries:
         return True
     sheets = sheets or get_sheets_service()
     week_start, _, _ = jm.get_current_week_range()
     week_start_date = week_start.date().isoformat()
 
-    rows = []
+    existing = (
+        sheets.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range=f"{ACTIVITY_TAB}!A2:G")
+        .execute()
+        .get("values")
+        or []
+    )
+
+    def _norm_text(value: object) -> str:
+        return " ".join(str(value or "").strip().split()).lower()
+
+    def _find_match_row(
+        user: str,
+        task_label: str,
+        category_label: str,
+        activity: str,
+    ) -> int | None:
+        """1-based sheet row number of the latest matching row this week."""
+        target = (
+            _norm_text(user),
+            _norm_text(task_label),
+            _norm_text(category_label),
+            _norm_text(activity),
+        )
+        for idx in range(len(existing) - 1, -1, -1):
+            padded = list(existing[idx]) + [""] * (7 - len(existing[idx]))
+            row_week = str(padded[6] or "").strip()
+            if row_week and row_week != week_start_date:
+                continue
+            key = (
+                _norm_text(padded[1]),
+                _norm_text(padded[3]),
+                _norm_text(padded[4]),
+                _norm_text(padded[5]),
+            )
+            if key == target:
+                return idx + 2  # header is row 1
+        return None
+
+    to_append: list[list] = []
     for entry in entries:
-        rows.append(
-            [
-                entry.timestamp_str,
-                entry.user,
-                entry.hours,
-                entry.task_label,
-                entry.category_label,
-                entry.activity,
-                week_start_date,
-            ]
+        task_label = entry.task_label
+        category_label = entry.category_label
+        match_row = _find_match_row(
+            entry.user, task_label, category_label, entry.activity
+        )
+        if match_row is None:
+            to_append.append(
+                [
+                    entry.timestamp_str,
+                    entry.user,
+                    entry.hours,
+                    task_label,
+                    category_label,
+                    entry.activity,
+                    week_start_date,
+                ]
+            )
+            # Keep in-memory view accurate for later duplicates in this batch.
+            existing.append(
+                [
+                    entry.timestamp_str,
+                    entry.user,
+                    entry.hours,
+                    task_label,
+                    category_label,
+                    entry.activity,
+                    week_start_date,
+                ]
+            )
+            continue
+
+        padded = list(existing[match_row - 2]) + [""] * 7
+        try:
+            current_hours = float(padded[2] or 0)
+        except (TypeError, ValueError):
+            current_hours = 0.0
+        new_hours = round(current_hours + float(entry.hours), 2)
+        sheets.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{ACTIVITY_TAB}!A{match_row}:C{match_row}",
+            valueInputOption="USER_ENTERED",
+            body={
+                "values": [[entry.timestamp_str, entry.user, new_hours]],
+            },
+        ).execute()
+        existing[match_row - 2][0] = entry.timestamp_str
+        existing[match_row - 2][2] = new_hours
+        print(
+            f"  [SHEETS] Merged {entry.hours:g} hr into ActivityLog row {match_row} "
+            f"(now {new_hours:g} hr)",
+            flush=True,
         )
 
-    sheets.spreadsheets().values().append(
-        spreadsheetId=spreadsheet_id,
-        range=f"{ACTIVITY_TAB}!A:G",
-        valueInputOption="USER_ENTERED",
-        insertDataOption="INSERT_ROWS",
-        body={"values": rows},
-    ).execute()
+    if to_append:
+        sheets.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range=f"{ACTIVITY_TAB}!A:G",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": to_append},
+        ).execute()
     return True
 
 
