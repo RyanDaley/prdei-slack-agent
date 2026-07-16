@@ -3,8 +3,8 @@ Firestore data store for Projects, Tasks, Categories, and Users.
 
 Collections (document ID = Slack-friendly key, except users use slack_user_id):
   projects/{id}     { name, drive_folder_url }
-  tasks/{id}        { name }
-  categories/{id}   { name }
+  tasks/{id}        { name, project_id }   # id = "{project_id}__{slug}"
+  categories/{id}   { name }               # global
   users/{slack_id}  { slack_user_id, display_name, timesheet_folder_url, email, last_logtime? }
 
 Reads prefer Firestore; callers keep env.yaml / hardcoded maps as fallback.
@@ -40,6 +40,13 @@ class ProjectRecord:
 class NamedRecord:
     id: str
     name: str
+
+
+@dataclass
+class TaskRecord:
+    id: str
+    name: str
+    project_id: str
 
 
 @dataclass
@@ -125,17 +132,39 @@ def create_project(name: str, drive_folder_url: str = "") -> ProjectRecord:
     while coll.document(project_id).get().exists:
         project_id = f"{base}_{suffix}"
         suffix += 1
-    return upsert_project(project_id, name, drive_folder_url)
+    record = upsert_project(project_id, name, drive_folder_url)
+    return record
 
 
 # --- Tasks / Categories -------------------------------------------------------
 
-def list_tasks() -> list[NamedRecord]:
-    docs = get_db().collection(COL_TASKS).stream()
-    items = [
-        NamedRecord(id=doc.id, name=str((doc.to_dict() or {}).get("name") or doc.id))
-        for doc in docs
-    ]
+def task_doc_id(project_id: str, task_slug: str) -> str:
+    """Stable unique id so the same task name can exist on many projects."""
+    return f"{project_id}__{task_slug}"
+
+
+def _task_from_doc(doc) -> TaskRecord:
+    data = doc.to_dict() or {}
+    return TaskRecord(
+        id=doc.id,
+        name=str(data.get("name") or doc.id),
+        project_id=str(data.get("project_id") or "").strip(),
+    )
+
+
+def list_tasks(project_id: str | None = None) -> list[TaskRecord]:
+    """
+    List tasks. When project_id is set, only that project's tasks.
+    When None, return all tasks (for label maps / migration).
+    """
+    coll = get_db().collection(COL_TASKS)
+    if project_id:
+        docs = coll.where("project_id", "==", project_id).stream()
+    else:
+        docs = coll.stream()
+    items = [_task_from_doc(doc) for doc in docs]
+    if project_id:
+        items = [t for t in items if t.project_id == project_id]
     return sorted(items, key=lambda t: t.name.lower())
 
 
@@ -153,6 +182,15 @@ def upsert_named(collection: str, item_id: str, name: str) -> NamedRecord:
     return NamedRecord(id=item_id, name=name.strip())
 
 
+def upsert_task(task_id: str, name: str, project_id: str) -> TaskRecord:
+    payload = {
+        "name": name.strip(),
+        "project_id": project_id.strip(),
+    }
+    get_db().collection(COL_TASKS).document(task_id).set(payload, merge=True)
+    return TaskRecord(id=task_id, name=payload["name"], project_id=payload["project_id"])
+
+
 def create_named(collection: str, name: str) -> NamedRecord:
     base = slugify(name)
     item_id = base
@@ -164,12 +202,67 @@ def create_named(collection: str, name: str) -> NamedRecord:
     return upsert_named(collection, item_id, name)
 
 
-def create_task(name: str) -> NamedRecord:
-    return create_named(COL_TASKS, name)
+def create_task(name: str, project_id: str) -> TaskRecord:
+    project_id = (project_id or "").strip()
+    if not project_id:
+        raise ValueError("project_id is required to create a task")
+    base = slugify(name)
+    task_id = task_doc_id(project_id, base)
+    coll = get_db().collection(COL_TASKS)
+    suffix = 2
+    while coll.document(task_id).get().exists:
+        task_id = task_doc_id(project_id, f"{base}_{suffix}")
+        suffix += 1
+    return upsert_task(task_id, name, project_id)
 
 
 def create_category(name: str) -> NamedRecord:
     return create_named(COL_CATEGORIES, name)
+
+
+def ensure_project_tasks() -> dict[str, int]:
+    """
+    Idempotent migration: copy legacy global tasks (no project_id) onto each
+    project that has no scoped tasks yet, then delete the legacy docs.
+
+    Does not create any default tasks — each project starts empty and gets
+    tasks only via Slack (+) or explicit create_task calls.
+    """
+    projects = list_projects()
+    all_docs = list(get_db().collection(COL_TASKS).stream())
+    all_tasks = [_task_from_doc(doc) for doc in all_docs]
+    legacy = [t for t in all_tasks if not t.project_id]
+    scoped_by_project: dict[str, list[TaskRecord]] = {}
+    for task in all_tasks:
+        if task.project_id:
+            scoped_by_project.setdefault(task.project_id, []).append(task)
+
+    migrated = 0
+    for project in projects:
+        if scoped_by_project.get(project.id):
+            continue
+        if not legacy:
+            continue
+        for lt in legacy:
+            slug = slugify(lt.name) or slugify(lt.id) or "task"
+            if re.fullmatch(r"[a-z0-9_]+", lt.id) and "__" not in lt.id:
+                slug = lt.id
+            upsert_task(task_doc_id(project.id, slug), lt.name, project.id)
+            migrated += 1
+
+    deleted = 0
+    for lt in legacy:
+        get_db().collection(COL_TASKS).document(lt.id).delete()
+        deleted += 1
+
+    result = {
+        "projects": len(projects),
+        "migrated": migrated,
+        "deleted_legacy": deleted,
+    }
+    if migrated or deleted:
+        print(f"[FIRESTORE] ensure_project_tasks: {result}", flush=True)
+    return result
 
 
 # --- Users --------------------------------------------------------------------
@@ -300,7 +393,8 @@ def collection_is_empty(collection: str) -> bool:
 
 def seed_if_empty() -> dict[str, int]:
     """
-    Seed default Projects / Tasks / Categories / User when collections are empty.
+    Seed default Projects / Categories / User when collections are empty,
+    then ensure every project has its own task set.
     Safe to call on every startup.
     """
     import project_router
@@ -321,16 +415,6 @@ def seed_if_empty() -> dict[str, int]:
             )
             upsert_project(project_id, name, folder)
             seeded["projects"] += 1
-
-    if collection_is_empty(COL_TASKS):
-        for task_id, name in [
-            ("project_management", "Project Management"),
-            ("schematic_design", "Schematic Design"),
-            ("design_development", "Design Development"),
-            ("construction_documents", "Construction Documents"),
-        ]:
-            upsert_named(COL_TASKS, task_id, name)
-            seeded["tasks"] += 1
 
     if collection_is_empty(COL_CATEGORIES):
         for cat_id, name in [
@@ -358,7 +442,10 @@ def seed_if_empty() -> dict[str, int]:
             )
             seeded["users"] += 1
 
-    if any(seeded.values()):
+    task_stats = ensure_project_tasks()
+    seeded["tasks"] = int(task_stats.get("migrated") or 0)
+
+    if any(v for k, v in seeded.items() if k != "tasks") or task_stats.get("migrated"):
         print(f"[FIRESTORE] Seeded defaults: {seeded}", flush=True)
     else:
         print("[FIRESTORE] Collections already seeded — skip.", flush=True)

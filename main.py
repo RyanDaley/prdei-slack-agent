@@ -33,12 +33,16 @@ BREAK_PROJECT_OPTION = {
     "value": BREAK_PROJECT_VALUE,
 }
 
-FALLBACK_TASK_OPTIONS = [
-    {"text": {"type": "plain_text", "text": "Project Management"}, "value": "project_management"},
-    {"text": {"type": "plain_text", "text": "Schematic Design"}, "value": "schematic_design"},
-    {"text": {"type": "plain_text", "text": "Design Development"}, "value": "design_development"},
-    {"text": {"type": "plain_text", "text": "Construction Documents"}, "value": "construction_documents"},
-]
+# Slack static_select requires ≥1 option; these are placeholders, not real tasks.
+TASK_OPTION_NEED_PROJECT = {
+    "text": {"type": "plain_text", "text": "Select a project first"},
+    "value": "_need_project",
+}
+TASK_OPTION_EMPTY = {
+    "text": {"type": "plain_text", "text": "No tasks yet — use +"},
+    "value": "_no_tasks",
+}
+PLACEHOLDER_TASK_VALUES = {TASK_OPTION_NEED_PROJECT["value"], TASK_OPTION_EMPTY["value"]}
 
 FALLBACK_CATEGORY_OPTIONS = [
     {"text": {"type": "plain_text", "text": "CAD / BIM Modeling"}, "value": "cad_modeling"},
@@ -78,14 +82,18 @@ def _project_options(*, allow_break: bool) -> list[dict]:
     return options
 
 
-def _task_options() -> list[dict]:
+def _task_options(project_id: str | None = None) -> list[dict]:
+    """Tasks for one project. Placeholders when project is missing/Break."""
+    if not project_id or project_id == BREAK_PROJECT_VALUE:
+        return [TASK_OPTION_NEED_PROJECT]
     try:
-        tasks = firestore_store.list_tasks()
+        tasks = firestore_store.list_tasks(project_id)
         if tasks:
             return [_option(t.name, t.id) for t in tasks]
+        return [TASK_OPTION_EMPTY]
     except Exception as exc:
-        print(f"[SLACK] Firestore task options failed; using fallback: {exc}", flush=True)
-    return list(FALLBACK_TASK_OPTIONS)
+        print(f"[SLACK] Firestore task options failed; using empty placeholder: {exc}", flush=True)
+        return [TASK_OPTION_EMPTY]
 
 
 def _category_options() -> list[dict]:
@@ -155,8 +163,16 @@ def _preserve_state_from_last_logtime(last: firestore_store.LastLogtime) -> dict
                 "project_select": {"selected_option": {"value": entry.project_key}}
             }
         if entry.task:
+            task_id = entry.task
+            # Legacy global task keys → project-scoped document ids for prefill.
+            if (
+                entry.project_key
+                and entry.project_key != BREAK_PROJECT_VALUE
+                and "__" not in task_id
+            ):
+                task_id = firestore_store.task_doc_id(entry.project_key, task_id)
             state[task_block_id] = {
-                "task_select": {"selected_option": {"value": entry.task}}
+                "task_select": {"selected_option": {"value": task_id}}
             }
         if entry.category:
             state[category_block_id] = {
@@ -223,6 +239,8 @@ def _entry_is_filled(state: dict | None, row_index: int) -> bool:
     task_key = _state_value(state, task_block_id, "task_select", "selected_option")
     category_key = _state_value(state, category_block_id, "category_select", "selected_option")
     accomplishment = _state_value(state, accomplishment_block_id, "accomplishment_input")
+    if task_key in PLACEHOLDER_TASK_VALUES:
+        task_key = None
     return bool(task_key and category_key and accomplishment and str(accomplishment).strip())
 
 
@@ -249,6 +267,29 @@ def _row_count_for_state(state: dict | None, current_row_count: int | None = Non
     return min(MAX_ENTRY_ROWS, max(MIN_ENTRY_ROWS, filled + 1))
 
 
+def _sanitize_task_selections(state: dict | None) -> dict | None:
+    """Drop task selections that don't belong to the row's current project."""
+    if not state:
+        return state
+    for row_index in range(MAX_ENTRY_ROWS):
+        project_block_id, task_block_id, _, _ = _entry_block_ids(row_index)
+        if project_block_id not in state and task_block_id not in state:
+            continue
+        project_key = _state_value(state, project_block_id, "project_select", "selected_option")
+        task_key = _state_value(state, task_block_id, "task_select", "selected_option")
+        if not task_key:
+            continue
+        valid_ids = {opt["value"] for opt in _task_options(project_key)}
+        if task_key not in valid_ids or task_key in PLACEHOLDER_TASK_VALUES:
+            block = dict(state.get(task_block_id) or {})
+            block.pop("task_select", None)
+            if block:
+                state[task_block_id] = block
+            else:
+                state.pop(task_block_id, None)
+    return state
+
+
 def _entry_row_blocks(
     row_index: int,
     preserve_state: dict | None = None,
@@ -261,7 +302,10 @@ def _entry_row_blocks(
     ) = _entry_block_ids(row_index)
     duration_block_id = _duration_block_id(row_index)
     project_options = _project_options(allow_break=True)
-    task_options = _task_options()
+    saved_project = _state_value(
+        preserve_state, project_block_id, "project_select", "selected_option"
+    )
+    task_options = _task_options(saved_project)
     category_options = _category_options()
 
     saved_duration = (
@@ -308,9 +352,6 @@ def _entry_row_blocks(
         "placeholder": {"type": "plain_text", "text": "What did you accomplish?"},
     }
 
-    saved_project = _state_value(
-        preserve_state, project_block_id, "project_select", "selected_option"
-    )
     saved_task = _state_value(
         preserve_state, task_block_id, "task_select", "selected_option"
     )
@@ -325,7 +366,7 @@ def _entry_row_blocks(
         matched = next((opt for opt in project_options if opt["value"] == saved_project), None)
         if matched:
             project_element["initial_option"] = matched
-    if saved_task:
+    if saved_task and saved_task not in PLACEHOLDER_TASK_VALUES:
         matched_task = next((opt for opt in task_options if opt["value"] == saved_task), None)
         if matched_task:
             task_element["initial_option"] = matched_task
@@ -370,7 +411,7 @@ def _entry_row_blocks(
                 _create_plus_button(
                     "create_task_btn",
                     str(row_index),
-                    "Create a new task",
+                    "Create a new task for this project",
                 ),
             ],
         },
@@ -423,6 +464,7 @@ def build_logtime_modal(
                     "type": "mrkdwn",
                     "text": (
                         "Use *+* next to Project / Task / Category to create a new one. "
+                        "Tasks belong to the selected project. "
                         "A new blank entry appears when every visible entry is filled."
                     ),
                 }
@@ -493,6 +535,9 @@ def _parse_modal_submission(state_values: dict, user_name: str) -> tuple[list[jm
             break_hours += hours
             continue
 
+        if task_key in PLACEHOLDER_TASK_VALUES:
+            task_key = None
+
         missing_fields = []
         if not task_key:
             missing_fields.append("task")
@@ -528,19 +573,25 @@ def _parse_modal_submission(state_values: dict, user_name: str) -> tuple[list[jm
 
 def _maybe_expand_logtime_view(ack, body, client) -> None:
     """Ack and rebuild the modal with an extra blank row when all slots are filled."""
+    _rebuild_logtime_view(ack, body, client, force=False)
+
+
+def _rebuild_logtime_view(ack, body, client, *, force: bool) -> None:
+    """Rebuild logtime modal from current state (always when force=True)."""
     ack()
     view = body.get("view") or {}
-    state = view.get("state", {}).get("values", {})
+    state = _sanitize_task_selections(dict(view.get("state", {}).get("values", {}) or {}))
     try:
         meta = json.loads(view.get("private_metadata") or "{}")
     except Exception:
         meta = {}
     current = int(meta.get("row_count") or _row_count_from_view_state(state))
     desired = _row_count_for_state(state, current)
-    if desired <= current:
+    if not force and desired <= current:
         return
-    meta["row_count"] = desired
-    updated = build_logtime_modal(row_count=desired, preserve_state=state)
+    meta["row_count"] = max(desired, current) if force else desired
+    row_count = meta["row_count"]
+    updated = build_logtime_modal(row_count=row_count, preserve_state=state)
     updated["private_metadata"] = json.dumps(meta)
     try:
         client.views_update(
@@ -549,7 +600,7 @@ def _maybe_expand_logtime_view(ack, body, client) -> None:
             view=updated,
         )
     except Exception as exc:
-        print(f"[SLACK WARNING] Could not expand logtime modal: {exc}", flush=True)
+        print(f"[SLACK WARNING] Could not refresh logtime modal: {exc}", flush=True)
 
 
 def _parent_metadata_from_view(view: dict) -> dict:
@@ -594,8 +645,22 @@ def _build_create_named_modal(kind: str, parent_meta: dict) -> dict:
                         "type": "mrkdwn",
                         "text": (
                             "After you submit, you'll get a short-lived link to choose "
-                            "the project's Google Drive folder."
+                            "the project's Google Drive folder. Add tasks for the "
+                            "project with *+* next to Task after selecting it."
                         ),
+                    }
+                ],
+            }
+        )
+    if kind == "task":
+        project_name = parent_meta.get("project_name") or parent_meta.get("project_id") or "this project"
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"This task will only appear for *{project_name}*.",
                     }
                 ],
             }
@@ -739,7 +804,8 @@ def handle_open_logtime_modal(ack, body, client):
 
 @app.action("project_select")
 def handle_project_select(ack, body, client):
-    _maybe_expand_logtime_view(ack, body, client)
+    # Rebuild so the Task dropdown switches to this project's tasks.
+    _rebuild_logtime_view(ack, body, client, force=True)
 
 
 @app.action("task_select")
@@ -788,7 +854,50 @@ def handle_create_project_btn(ack, body, client):
 
 @app.action("create_task_btn")
 def handle_create_task_btn(ack, body, client):
-    _push_create_modal(ack, body, client, "task")
+    ack()
+    trigger_id = body.get("trigger_id")
+    if not trigger_id:
+        return
+    view = body.get("view") or {}
+    actions = body.get("actions") or []
+    try:
+        row_index = int((actions[0] or {}).get("value") or 0)
+    except (TypeError, ValueError, IndexError):
+        row_index = 0
+    state = view.get("state", {}).get("values", {})
+    project_block_id, _, _, _ = _entry_block_ids(row_index)
+    project_id = _state_value(state, project_block_id, "project_select", "selected_option")
+    user_id = body.get("user", {}).get("id", "")
+    channel_id = ""
+    try:
+        root_meta = json.loads(view.get("private_metadata") or "{}")
+        channel_id = root_meta.get("channel_id") or ""
+        user_id = root_meta.get("user_id") or user_id
+    except Exception:
+        root_meta = {}
+
+    if not project_id or project_id == BREAK_PROJECT_VALUE:
+        client.chat_postEphemeral(
+            channel=channel_id or user_id,
+            user=user_id,
+            text="Select a project on that entry first, then use *+* to add a task for it.",
+        )
+        return
+
+    parent_meta = _parent_metadata_from_view(view)
+    parent_meta["channel_id"] = channel_id
+    parent_meta["user_id"] = user_id
+    parent_meta["project_id"] = project_id
+    parent_meta["row_index"] = row_index
+    try:
+        project = firestore_store.get_project(project_id)
+        parent_meta["project_name"] = project.name if project else project_id
+    except Exception:
+        parent_meta["project_name"] = project_id
+    client.views_push(
+        trigger_id=trigger_id,
+        view=_build_create_named_modal("task", parent_meta),
+    )
 
 
 @app.action("create_category_btn")
@@ -799,23 +908,34 @@ def handle_create_category_btn(ack, body, client):
 @app.view("create_task_modal")
 def handle_create_task_modal(ack, body, client, view):
     name = (_state_value(view.get("state", {}).get("values", {}), "name_block", "name_input") or "").strip()
+    parent_meta = json.loads(view.get("private_metadata") or "{}")
+    project_id = (parent_meta.get("project_id") or "").strip()
     if not name:
         ack(response_action="errors", errors={"name_block": "Enter a task name."})
         return
+    if not project_id:
+        ack(
+            response_action="errors",
+            errors={"name_block": "Select a project on the entry, then create the task again."},
+        )
+        return
     try:
-        created = firestore_store.create_task(name)
+        created = firestore_store.create_task(name, project_id)
     except Exception as exc:
         ack(response_action="errors", errors={"name_block": f"Could not create task: {exc}"})
         return
     ack()
-    parent_meta = json.loads(view.get("private_metadata") or "{}")
     _refresh_parent_logtime(client, parent_meta)
     user_id = body.get("user", {}).get("id") or parent_meta.get("user_id")
+    project_label = parent_meta.get("project_name") or project_id
     if user_id:
         client.chat_postEphemeral(
             channel=parent_meta.get("channel_id") or user_id,
             user=user_id,
-            text=f"✅ Created task *{created.name}* (`{created.id}`). It is now in the Task dropdown.",
+            text=(
+                f"✅ Created task *{created.name}* for *{project_label}*. "
+                "It is now in that project's Task dropdown."
+            ),
         )
 
 

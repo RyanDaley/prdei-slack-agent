@@ -41,7 +41,14 @@ def _firestore_task_labels() -> dict[str, str]:
     try:
         import firestore_store
 
-        return {item.id: item.name for item in firestore_store.list_tasks()}
+        labels = {item.id: item.name for item in firestore_store.list_tasks()}
+        # Also map bare slugs from legacy entries (last segment after __).
+        for item in list(labels.items()):
+            task_id, name = item
+            if "__" in task_id:
+                slug = task_id.split("__", 1)[1]
+                labels.setdefault(slug, name)
+        return labels
     except Exception:
         return {}
 
