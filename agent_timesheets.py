@@ -574,27 +574,32 @@ def _last_project_sheet_row(sheets, spreadsheet_id: str) -> int | None:
 def _refresh_totals_row(sheets, spreadsheet_id: str) -> None:
     """
     Place a Total row 3 rows below the last project row.
-    Clear stale borders from the data area, then top-border only the Total row.
+    Keep normal sheet gridlines; put a bold top border only on the Total row.
     """
     last_project = _last_project_sheet_row(sheets, spreadsheet_id)
     if last_project is None:
         return
 
     total_row = last_project + 3
-    # Clear any prior Total label elsewhere in the data area (moved when rows added).
     sheet_id = _timesheet_sheet_id(sheets, spreadsheet_id)
     existing = _read_data_rows(sheets, spreadsheet_id)
+
+    # Rows that may still carry a leftover Total top-border from an earlier position.
+    stale_border_rows: set[int] = set()
     for idx, row in enumerate(existing):
         label = _norm(row[0] if row else "")
         row_num = _row_number_for_index(idx)
         if label.lower() == "total" and row_num != total_row:
+            stale_border_rows.add(row_num)
             sheets.spreadsheets().values().clear(
                 spreadsheetId=spreadsheet_id,
                 range=f"{TIMESHEET_TAB}!A{row_num}:L{row_num}",
             ).execute()
 
-    # Blank padding rows between last project and Total.
-    for blank_row in (last_project + 1, last_project + 2):
+    # Blank padding rows between last project and Total (and slightly past, in case
+    # Total shifted down from a previous refresh).
+    for blank_row in range(last_project + 1, total_row):
+        stale_border_rows.add(blank_row)
         sheets.spreadsheets().values().clear(
             spreadsheetId=spreadsheet_id,
             range=f"{TIMESHEET_TAB}!A{blank_row}:L{blank_row}",
@@ -623,99 +628,103 @@ def _refresh_totals_row(sheets, spreadsheet_id: str) -> None:
         body={"values": values},
     ).execute()
 
-    # Strip any leftover borders from earlier Total positions (values clear does not
-    # remove cell format), then put a top border only on the current Total row.
-    no_border = {"style": "NONE"}
+    requests: list[dict] = [
+        # Keep normal sheet gridlines visible in the timesheet tab.
+        {
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": sheet_id,
+                    "gridProperties": {"hideGridlines": False},
+                },
+                "fields": "gridProperties.hideGridlines",
+            }
+        },
+        # Drop any previous user-entered border overrides (including STYLE NONE
+        # wipe from older code) so the default grid shows again.
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": HEADER_ROW - 1,
+                    "endRowIndex": total_row + 5,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 12,
+                },
+                "cell": {},
+                "fields": "userEnteredFormat.borders",
+            }
+        },
+    ]
+
+    # Bold top border across A:L on the Total row only.
+    requests.append(
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": total_row - 1,
+                    "endRowIndex": total_row,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 12,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "borders": {
+                            "top": {
+                                "style": "SOLID_MEDIUM",
+                                "width": 2,
+                                "color": {"red": 0, "green": 0, "blue": 0},
+                            }
+                        },
+                    }
+                },
+                "fields": "userEnteredFormat.borders.top",
+            }
+        }
+    )
+    # Bold only the "Total" label in column A; keep E–L numeric cells not bold.
+    requests.extend(
+        [
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": total_row - 1,
+                        "endRowIndex": total_row,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": 1,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "textFormat": {"bold": True},
+                        }
+                    },
+                    "fields": "userEnteredFormat.textFormat.bold",
+                }
+            },
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": total_row - 1,
+                        "endRowIndex": total_row,
+                        "startColumnIndex": 4,
+                        "endColumnIndex": 12,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "textFormat": {"bold": False},
+                        }
+                    },
+                    "fields": "userEnteredFormat.textFormat.bold",
+                }
+            },
+        ]
+    )
+
     sheets.spreadsheets().batchUpdate(
         spreadsheetId=spreadsheet_id,
-        body={
-            "requests": [
-                {
-                    "repeatCell": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "startRowIndex": DATA_START_ROW - 1,
-                            "endRowIndex": total_row + 5,
-                            "startColumnIndex": 0,
-                            "endColumnIndex": 12,
-                        },
-                        "cell": {
-                            "userEnteredFormat": {
-                                "borders": {
-                                    "top": no_border,
-                                    "bottom": no_border,
-                                    "left": no_border,
-                                    "right": no_border,
-                                }
-                            }
-                        },
-                        "fields": (
-                            "userEnteredFormat.borders.top,"
-                            "userEnteredFormat.borders.bottom,"
-                            "userEnteredFormat.borders.left,"
-                            "userEnteredFormat.borders.right"
-                        ),
-                    }
-                },
-                {
-                    "repeatCell": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "startRowIndex": total_row - 1,
-                            "endRowIndex": total_row,
-                            "startColumnIndex": 0,
-                            "endColumnIndex": 12,
-                        },
-                        "cell": {
-                            "userEnteredFormat": {
-                                "borders": {
-                                    "top": {
-                                        "style": "SOLID",
-                                        "width": 1,
-                                        "color": {"red": 0, "green": 0, "blue": 0},
-                                    }
-                                },
-                            }
-                        },
-                        "fields": "userEnteredFormat.borders.top",
-                    }
-                },
-                {
-                    "repeatCell": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "startRowIndex": total_row - 1,
-                            "endRowIndex": total_row,
-                            "startColumnIndex": 0,
-                            "endColumnIndex": 1,
-                        },
-                        "cell": {
-                            "userEnteredFormat": {
-                                "textFormat": {"bold": True},
-                            }
-                        },
-                        "fields": "userEnteredFormat.textFormat.bold",
-                    }
-                },
-                {
-                    "repeatCell": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "startRowIndex": total_row - 1,
-                            "endRowIndex": total_row,
-                            "startColumnIndex": 4,
-                            "endColumnIndex": 12,
-                        },
-                        "cell": {
-                            "userEnteredFormat": {
-                                "textFormat": {"bold": False},
-                            }
-                        },
-                        "fields": "userEnteredFormat.textFormat.bold",
-                    }
-                },
-            ]
-        },
+        body={"requests": requests},
     ).execute()
 
 

@@ -48,6 +48,12 @@ DRIVE_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 
+# Service accounts that must be able to read/write project journal folders.
+DEFAULT_PROJECT_FOLDER_SHARE_EMAILS = (
+    "312720759301-compute@developer.gserviceaccount.com",
+    "service-312720759301@gcp-sa-vertex-rag.iam.gserviceaccount.com",
+)
+
 
 @dataclass
 class ProjectAssets:
@@ -61,6 +67,109 @@ class ProjectAssets:
 def get_drive_service():
     credentials, _ = google.auth.default(scopes=DRIVE_SCOPES)
     return build("drive", "v3", credentials=credentials)
+
+
+def _drive_service_from_user_token(access_token: str):
+    from google.oauth2.credentials import Credentials
+
+    credentials = Credentials(token=access_token)
+    return build("drive", "v3", credentials=credentials)
+
+
+def project_folder_share_emails() -> list[str]:
+    """
+    Emails granted writer access on newly linked project folders.
+    Override with comma-separated PROJECT_FOLDER_SHARE_EMAILS if needed.
+    """
+    import os
+
+    raw = os.environ.get("PROJECT_FOLDER_SHARE_EMAILS", "").strip()
+    if raw:
+        return [part.strip() for part in raw.split(",") if part.strip()]
+    return list(DEFAULT_PROJECT_FOLDER_SHARE_EMAILS)
+
+
+def share_folder_with_service_accounts(
+    folder_id: str,
+    *,
+    access_token: str | None = None,
+    emails: list[str] | None = None,
+    role: str = "writer",
+) -> tuple[bool, list[str]]:
+    """
+    Grant the agent service accounts access to a project folder.
+
+    Requires a user OAuth access token. The Cloud Run service account typically
+    cannot see a brand-new folder until after it is shared, so ADC fallback is
+    intentionally avoided (it surfaces as Drive 404 File not found).
+
+    Returns (all_ok, notes).
+    """
+    targets = emails or project_folder_share_emails()
+    if not folder_id or not targets:
+        return True, []
+
+    if not (access_token or "").strip():
+        return False, [
+            "Google sign-in is required to share the folder with the agent service accounts."
+        ]
+
+    notes: list[str] = []
+    try:
+        drive = _drive_service_from_user_token(access_token.strip())
+    except Exception as exc:
+        return False, [f"could not build Drive client from user token: {exc}"]
+
+    # Confirm the user token can see the folder (Shared Drives need supportsAllDrives).
+    try:
+        drive.files().get(
+            fileId=folder_id,
+            fields="id,name,driveId",
+            supportsAllDrives=True,
+        ).execute()
+    except Exception as exc:
+        return False, [
+            f"signed-in Google account cannot access that folder ({exc}). "
+            "Open the folder in Drive with this account, or paste a folder you can share."
+        ]
+
+    all_ok = True
+    for email in targets:
+        try:
+            drive.permissions().create(
+                fileId=folder_id,
+                body={
+                    "type": "user",
+                    "role": role,
+                    "emailAddress": email,
+                },
+                sendNotificationEmail=False,
+                supportsAllDrives=True,
+                fields="id",
+            ).execute()
+            print(
+                f"[ROUTER] Shared folder {folder_id} with {email} "
+                f"as {role} via user OAuth",
+                flush=True,
+            )
+            notes.append(f"shared with {email}")
+        except Exception as exc:
+            message = str(exc)
+            if "alreadyExists" in message or "duplicate" in message.lower():
+                print(
+                    f"[ROUTER] Folder {folder_id} already shared with {email}",
+                    flush=True,
+                )
+                notes.append(f"{email} already had access")
+                continue
+            all_ok = False
+            notes.append(f"{email}: {exc}")
+            print(
+                f"[ROUTER WARNING] Could not share folder {folder_id} "
+                f"with {email}: {exc}",
+                flush=True,
+            )
+    return all_ok, notes
 
 
 def extract_id_from_url(input_string: str, kind: str = "folder") -> str:

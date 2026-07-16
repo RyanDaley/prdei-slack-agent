@@ -56,6 +56,7 @@ class LastLogEntry:
     task: str
     category: str
     activity: str
+    hours: str = "1.0"
 
 
 @dataclass
@@ -231,11 +232,13 @@ def get_last_logtime(slack_user_id: str) -> Optional[LastLogtime]:
                 task=str(item.get("task") or "").strip(),
                 category=str(item.get("category") or "").strip(),
                 activity=str(item.get("activity") or "").strip(),
+                hours=str(item.get("hours") or data.get("duration") or "1.0").strip()
+                or "1.0",
             )
         )
     if not entries:
         return None
-    duration = str(data.get("duration") or "1.0").strip() or "1.0"
+    duration = str(data.get("duration") or entries[0].hours or "1.0").strip() or "1.0"
     return LastLogtime(duration=duration, entries=entries)
 
 
@@ -260,6 +263,7 @@ def set_last_logtime(
                     "task": item.task,
                     "category": item.category,
                     "activity": item.activity,
+                    "hours": (item.hours or "1.0").strip() or "1.0",
                 }
             )
         elif isinstance(item, dict):
@@ -272,6 +276,7 @@ def set_last_logtime(
                     "task": str(item.get("task") or "").strip(),
                     "category": str(item.get("category") or "").strip(),
                     "activity": str(item.get("activity") or "").strip(),
+                    "hours": str(item.get("hours") or "1.0").strip() or "1.0",
                 }
             )
     if not serialized:

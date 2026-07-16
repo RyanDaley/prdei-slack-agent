@@ -46,11 +46,19 @@ FALLBACK_CATEGORY_OPTIONS = [
     {"text": {"type": "plain_text", "text": "Engineering / Calcs"}, "value": "engineering"},
 ]
 
-DURATION_OPTIONS = [
-    {"text": {"type": "plain_text", "text": "1.0 hr (single activity)"}, "value": "1.0"},
-    {"text": {"type": "plain_text", "text": "0.5 hr (two activities)"}, "value": "0.5"},
-    {"text": {"type": "plain_text", "text": "0.25 hr (four activities)"}, "value": "0.25"},
+ENTRY_DURATION_OPTIONS = [
+    {"text": {"type": "plain_text", "text": "0.25 hr"}, "value": "0.25"},
+    {"text": {"type": "plain_text", "text": "0.5 hr"}, "value": "0.5"},
+    {"text": {"type": "plain_text", "text": "1.0 hr"}, "value": "1.0"},
+    {"text": {"type": "plain_text", "text": "1.25 hr"}, "value": "1.25"},
+    {"text": {"type": "plain_text", "text": "1.5 hr"}, "value": "1.5"},
+    {"text": {"type": "plain_text", "text": "1.75 hr"}, "value": "1.75"},
+    {"text": {"type": "plain_text", "text": "2.0 hr"}, "value": "2.0"},
 ]
+ENTRY_DURATION_VALUES = {opt["value"] for opt in ENTRY_DURATION_OPTIONS}
+DEFAULT_ENTRY_DURATION = "1.0"
+MIN_ENTRY_ROWS = 2
+MAX_ENTRY_ROWS = 6
 
 
 def _option(text: str, value: str) -> dict:
@@ -102,42 +110,46 @@ def _create_plus_button(action_id: str, value: str, accessibility_label: str) ->
 
 
 def _open_logtime_modal(client, trigger_id: str, channel_id: str, user_id: str):
-    duration = "1.0"
     preserve_state = None
+    row_count = MIN_ENTRY_ROWS
     try:
         last = firestore_store.get_last_logtime(user_id)
         if last and last.entries:
-            duration, preserve_state = _preserve_state_from_last_logtime(last)
+            preserve_state = _preserve_state_from_last_logtime(last)
+            row_count = _row_count_for_state(preserve_state)
             print(
                 f"[SLACK] Prefilling logtime for {user_id} "
-                f"from last entry ({len(last.entries)} row(s), {duration} hr).",
+                f"from last entry ({len(last.entries)} row(s), {row_count} slots).",
                 flush=True,
             )
     except Exception as exc:
         print(f"[SLACK WARNING] Could not load last logtime for {user_id}: {exc}", flush=True)
 
-    modal = build_logtime_modal(duration=duration, preserve_state=preserve_state)
+    modal = build_logtime_modal(row_count=row_count, preserve_state=preserve_state)
     modal["private_metadata"] = json.dumps(
-        {"channel_id": channel_id, "user_id": user_id}
+        {"channel_id": channel_id, "user_id": user_id, "row_count": row_count}
     )
     client.views_open(trigger_id=trigger_id, view=modal)
 
 
-def _preserve_state_from_last_logtime(last: firestore_store.LastLogtime) -> tuple[str, dict]:
+def _preserve_state_from_last_logtime(last: firestore_store.LastLogtime) -> dict:
     """
     Build Slack-shaped preserve_state so build_logtime_modal can set
     initial_option / initial_value from the previous submission.
     """
-    duration = last.duration if last.duration in jm.DURATION_ROW_COUNTS else "1.0"
-    max_rows = jm.DURATION_ROW_COUNTS.get(duration, 1)
     state: dict = {}
-    for row_index, entry in enumerate(last.entries[:max_rows]):
+    for row_index, entry in enumerate(last.entries[:MAX_ENTRY_ROWS]):
         (
             project_block_id,
             task_block_id,
             category_block_id,
             accomplishment_block_id,
         ) = _entry_block_ids(row_index)
+        duration_block_id = _duration_block_id(row_index)
+        hours = entry.hours if entry.hours in ENTRY_DURATION_VALUES else DEFAULT_ENTRY_DURATION
+        state[duration_block_id] = {
+            "entry_duration_select": {"selected_option": {"value": hours}}
+        }
         if entry.project_key:
             state[project_block_id] = {
                 "project_select": {"selected_option": {"value": entry.project_key}}
@@ -154,7 +166,7 @@ def _preserve_state_from_last_logtime(last: firestore_store.LastLogtime) -> tupl
             state[accomplishment_block_id] = {
                 "accomplishment_input": {"value": entry.activity}
             }
-    return duration, state
+    return state
 
 
 def _state_value(state: dict | None, block_id: str, action_id: str, field: str = "value"):
@@ -171,6 +183,20 @@ def _state_value(state: dict | None, block_id: str, action_id: str, field: str =
     return None
 
 
+def _duration_block_id(row_index: int) -> str:
+    return f"entry_{row_index}_duration_block"
+
+
+def _hours_to_option_value(hours: float) -> str:
+    for opt in ENTRY_DURATION_OPTIONS:
+        try:
+            if abs(float(opt["value"]) - float(hours)) < 1e-9:
+                return opt["value"]
+        except (TypeError, ValueError):
+            continue
+    return DEFAULT_ENTRY_DURATION
+
+
 def _entry_block_ids(row_index: int) -> tuple[str, str, str, str]:
     """Return (project_block_id, task_block_id, category_block_id, accomplishment_block_id)."""
     return (
@@ -181,12 +207,51 @@ def _entry_block_ids(row_index: int) -> tuple[str, str, str, str]:
     )
 
 
+def _entry_is_filled(state: dict | None, row_index: int) -> bool:
+    """True when a work entry (or Break) is complete enough to free another blank slot."""
+    (
+        project_block_id,
+        task_block_id,
+        category_block_id,
+        accomplishment_block_id,
+    ) = _entry_block_ids(row_index)
+    project_key = _state_value(state, project_block_id, "project_select", "selected_option")
+    if not project_key:
+        return False
+    if project_key == BREAK_PROJECT_VALUE:
+        return True
+    task_key = _state_value(state, task_block_id, "task_select", "selected_option")
+    category_key = _state_value(state, category_block_id, "category_select", "selected_option")
+    accomplishment = _state_value(state, accomplishment_block_id, "accomplishment_input")
+    return bool(task_key and category_key and accomplishment and str(accomplishment).strip())
+
+
+def _row_count_from_view_state(state: dict | None) -> int:
+    """How many entry slots are present in the current modal state."""
+    if not state:
+        return MIN_ENTRY_ROWS
+    count = 0
+    while (
+        _duration_block_id(count) in state
+        or f"entry_{count}_project_block" in state
+        or f"entry_{count}_accomplishment_block" in state
+    ):
+        count += 1
+        if count >= MAX_ENTRY_ROWS:
+            break
+    return max(count, MIN_ENTRY_ROWS)
+
+
+def _row_count_for_state(state: dict | None, current_row_count: int | None = None) -> int:
+    """Always leave one blank slot after filled rows (min 2, max MAX_ENTRY_ROWS)."""
+    base = current_row_count or _row_count_from_view_state(state)
+    filled = sum(1 for i in range(base) if _entry_is_filled(state, i))
+    return min(MAX_ENTRY_ROWS, max(MIN_ENTRY_ROWS, filled + 1))
+
+
 def _entry_row_blocks(
     row_index: int,
-    duration: str,
     preserve_state: dict | None = None,
-    *,
-    side_by_side: bool = False,
 ) -> list[dict]:
     (
         project_block_id,
@@ -194,10 +259,27 @@ def _entry_row_blocks(
         category_block_id,
         accomplishment_block_id,
     ) = _entry_block_ids(row_index)
-    project_options = _project_options(allow_break=side_by_side)
+    duration_block_id = _duration_block_id(row_index)
+    project_options = _project_options(allow_break=True)
     task_options = _task_options()
     category_options = _category_options()
 
+    saved_duration = (
+        _state_value(preserve_state, duration_block_id, "entry_duration_select", "selected_option")
+        or DEFAULT_ENTRY_DURATION
+    )
+    if saved_duration not in ENTRY_DURATION_VALUES:
+        saved_duration = DEFAULT_ENTRY_DURATION
+    duration_option = next(
+        opt for opt in ENTRY_DURATION_OPTIONS if opt["value"] == saved_duration
+    )
+
+    duration_element = {
+        "type": "static_select",
+        "action_id": "entry_duration_select",
+        "initial_option": duration_option,
+        "options": ENTRY_DURATION_OPTIONS,
+    }
     project_element = {
         "type": "static_select",
         "action_id": "project_select",
@@ -220,6 +302,9 @@ def _entry_row_blocks(
         "type": "plain_text_input",
         "action_id": "accomplishment_input",
         "multiline": True,
+        "dispatch_action_config": {
+            "trigger_actions_on": ["on_character_entered"],
+        },
         "placeholder": {"type": "plain_text", "text": "What did you accomplish?"},
     }
 
@@ -253,12 +338,17 @@ def _entry_row_blocks(
     if saved_accomplishment:
         accomplishment_element["initial_value"] = saved_accomplishment
 
-    row_label = f"Entry {row_index + 1} ({duration} hr)"
+    row_label = f"Entry {row_index + 1}"
     blocks: list[dict] = [
         {"type": "divider"},
         {
             "type": "section",
             "text": {"type": "mrkdwn", "text": f"*{row_label}*"},
+        },
+        {
+            "type": "actions",
+            "block_id": duration_block_id,
+            "elements": [duration_element],
         },
         {
             "type": "actions",
@@ -299,18 +389,20 @@ def _entry_row_blocks(
         {
             "type": "input",
             "block_id": accomplishment_block_id,
+            "dispatch_action": True,
             "element": accomplishment_element,
             "label": {"type": "plain_text", "text": "What did you accomplish?"},
-            "optional": side_by_side,
+            "optional": True,
         },
     ]
     return blocks
 
 
-def build_logtime_modal(duration: str = "1.0", preserve_state: dict | None = None) -> dict:
-    row_count = jm.DURATION_ROW_COUNTS.get(duration, 1)
-    duration_option = next(opt for opt in DURATION_OPTIONS if opt["value"] == duration)
-    side_by_side = row_count > 1
+def build_logtime_modal(
+    row_count: int = MIN_ENTRY_ROWS,
+    preserve_state: dict | None = None,
+) -> dict:
+    row_count = min(MAX_ENTRY_ROWS, max(MIN_ENTRY_ROWS, int(row_count or MIN_ENTRY_ROWS)))
 
     blocks = [
         {
@@ -318,8 +410,9 @@ def build_logtime_modal(duration: str = "1.0", preserve_state: dict | None = Non
             "text": {
                 "type": "mrkdwn",
                 "text": (
-                    "Log your activities for the past hour. "
-                    "Choose a duration to split the hour across multiple projects or tasks."
+                    "Log your activities. Each entry has its own duration "
+                    "(defaults to *1.0 hr*). Leave unused entries blank — "
+                    "they count as Break and are not written to the journal."
                 ),
             },
         },
@@ -329,51 +422,16 @@ def build_logtime_modal(duration: str = "1.0", preserve_state: dict | None = Non
                 {
                     "type": "mrkdwn",
                     "text": (
-                        "Use *+* next to Project / Task / Category to create a new one."
+                        "Use *+* next to Project / Task / Category to create a new one. "
+                        "A new blank entry appears when every visible entry is filled."
                     ),
                 }
             ],
         },
-        {
-            "type": "input",
-            "block_id": "duration_block",
-            "dispatch_action": True,
-            "element": {
-                "type": "static_select",
-                "action_id": "duration_select",
-                "initial_option": duration_option,
-                "options": DURATION_OPTIONS,
-            },
-            "label": {"type": "plain_text", "text": "Duration per entry"},
-        },
     ]
 
-    if side_by_side:
-        blocks.append(
-            {
-                "type": "context",
-                "elements": [
-                    {
-                        "type": "mrkdwn",
-                        "text": (
-                            "Choose *Break* on any unused slice — "
-                            "Break entries are not written to the detailed activity log. "
-                            "Task, Category, and accomplishment are optional for Break."
-                        ),
-                    }
-                ],
-            }
-        )
-
     for row_index in range(row_count):
-        blocks.extend(
-            _entry_row_blocks(
-                row_index,
-                duration,
-                preserve_state,
-                side_by_side=side_by_side,
-            )
-        )
+        blocks.extend(_entry_row_blocks(row_index, preserve_state))
 
     return {
         "type": "modal",
@@ -389,13 +447,11 @@ def _parse_modal_submission(state_values: dict, user_name: str) -> tuple[list[jm
     """
     Parse modal state into journal entries.
 
-    Returns (work_entries, errors, break_hours). Break rows are validated but not logged.
+    Returns (work_entries, errors, break_hours).
+    Empty rows (no project) and Break rows are not logged.
     """
     errors = {}
-    duration = _state_value(state_values, "duration_block", "duration_select", "selected_option") or "1.0"
-    row_count = jm.DURATION_ROW_COUNTS.get(duration, 1)
-    side_by_side = row_count > 1
-    hours = float(duration)
+    row_count = _row_count_from_view_state(state_values)
     now = datetime.now(ZoneInfo(jm.JOURNAL_TIMEZONE))
     entries = []
     break_hours = 0.0
@@ -407,24 +463,33 @@ def _parse_modal_submission(state_values: dict, user_name: str) -> tuple[list[jm
             category_block_id,
             accomplishment_block_id,
         ) = _entry_block_ids(row_index)
+        duration_block_id = _duration_block_id(row_index)
 
-        project_key = _state_value(state_values, project_block_id, "project_select", "selected_option")
+        hours_raw = (
+            _state_value(
+                state_values, duration_block_id, "entry_duration_select", "selected_option"
+            )
+            or DEFAULT_ENTRY_DURATION
+        )
+        try:
+            hours = float(hours_raw)
+        except (TypeError, ValueError):
+            hours = 1.0
+
+        project_key = _state_value(
+            state_values, project_block_id, "project_select", "selected_option"
+        )
         task_key = _state_value(state_values, task_block_id, "task_select", "selected_option")
         category_key = _state_value(
             state_values, category_block_id, "category_select", "selected_option"
         )
         accomplishment = _state_value(state_values, accomplishment_block_id, "accomplishment_input")
 
+        # Completely empty → treat as Break (not recorded; no break tally).
         if not project_key:
-            errors[accomplishment_block_id] = (
-                "Select a project (or Break)." if side_by_side else "Select a project."
-            )
             continue
 
         if project_key == BREAK_PROJECT_VALUE:
-            if not side_by_side:
-                errors[accomplishment_block_id] = "Break is only available for split-hour entries."
-                continue
             break_hours += hours
             continue
 
@@ -438,7 +503,8 @@ def _parse_modal_submission(state_values: dict, user_name: str) -> tuple[list[jm
         # Slack only accepts view errors on input blocks, not actions blocks.
         if missing_fields:
             errors[accomplishment_block_id] = (
-                f"Complete {' / '.join(missing_fields)} for this entry."
+                f"Complete {' / '.join(missing_fields)} for this entry, "
+                "or clear Project to leave it as Break."
             )
             continue
 
@@ -454,7 +520,36 @@ def _parse_modal_submission(state_values: dict, user_name: str) -> tuple[list[jm
             )
         )
 
+    if not entries and not errors:
+        errors[_entry_block_ids(0)[3]] = "Fill out at least one work entry before submitting."
+
     return entries, errors, break_hours
+
+
+def _maybe_expand_logtime_view(ack, body, client) -> None:
+    """Ack and rebuild the modal with an extra blank row when all slots are filled."""
+    ack()
+    view = body.get("view") or {}
+    state = view.get("state", {}).get("values", {})
+    try:
+        meta = json.loads(view.get("private_metadata") or "{}")
+    except Exception:
+        meta = {}
+    current = int(meta.get("row_count") or _row_count_from_view_state(state))
+    desired = _row_count_for_state(state, current)
+    if desired <= current:
+        return
+    meta["row_count"] = desired
+    updated = build_logtime_modal(row_count=desired, preserve_state=state)
+    updated["private_metadata"] = json.dumps(meta)
+    try:
+        client.views_update(
+            view_id=view.get("id"),
+            hash=view.get("hash"),
+            view=updated,
+        )
+    except Exception as exc:
+        print(f"[SLACK WARNING] Could not expand logtime modal: {exc}", flush=True)
 
 
 def _parent_metadata_from_view(view: dict) -> dict:
@@ -464,16 +559,8 @@ def _parent_metadata_from_view(view: dict) -> dict:
     except Exception:
         meta = {}
     meta["parent_view_id"] = view.get("id", "")
-    duration = _state_value(
-        view.get("state", {}).get("values", {}),
-        "duration_block",
-        "duration_select",
-        "selected_option",
-    ) or "1.0"
-    meta["duration"] = duration
     # Do not store preserve_state — Slack private_metadata max is 3000 chars.
     return meta
-
 
 def _build_create_named_modal(kind: str, parent_meta: dict) -> dict:
     titles = {
@@ -528,11 +615,12 @@ def _refresh_parent_logtime(client, parent_meta: dict) -> None:
     view_id = parent_meta.get("parent_view_id")
     if not view_id:
         return
-    duration = parent_meta.get("duration") or "1.0"
-    updated = build_logtime_modal(duration=duration)
+    row_count = int(parent_meta.get("row_count") or MIN_ENTRY_ROWS)
+    updated = build_logtime_modal(row_count=row_count)
     root_meta = {
         "channel_id": parent_meta.get("channel_id", ""),
         "user_id": parent_meta.get("user_id", ""),
+        "row_count": row_count,
     }
     updated["private_metadata"] = json.dumps(root_meta)
     try:
@@ -650,34 +738,28 @@ def handle_open_logtime_modal(ack, body, client):
 
 
 @app.action("project_select")
-def handle_project_select(ack):
-    ack()
+def handle_project_select(ack, body, client):
+    _maybe_expand_logtime_view(ack, body, client)
 
 
 @app.action("task_select")
-def handle_task_select(ack):
-    ack()
+def handle_task_select(ack, body, client):
+    _maybe_expand_logtime_view(ack, body, client)
 
 
 @app.action("category_select")
-def handle_category_select(ack):
-    ack()
+def handle_category_select(ack, body, client):
+    _maybe_expand_logtime_view(ack, body, client)
 
 
-@app.action("duration_select")
-def handle_duration_select(ack, body, client):
-    ack()
-    selected_duration = body["actions"][0]["selected_option"]["value"]
-    updated_view = build_logtime_modal(
-        duration=selected_duration,
-        preserve_state=body["view"]["state"]["values"],
-    )
-    updated_view["private_metadata"] = body["view"].get("private_metadata", "")
-    client.views_update(
-        view_id=body["view"]["id"],
-        hash=body["view"]["hash"],
-        view=updated_view,
-    )
+@app.action("entry_duration_select")
+def handle_entry_duration_select(ack, body, client):
+    _maybe_expand_logtime_view(ack, body, client)
+
+
+@app.action("accomplishment_input")
+def handle_accomplishment_input(ack, body, client):
+    _maybe_expand_logtime_view(ack, body, client)
 
 
 def _push_create_modal(ack, body, client, kind: str):
@@ -889,8 +971,7 @@ def handle_logtime_submission(ack, body, client, view):
     ack()
 
     duration = (
-        _state_value(state_values, "duration_block", "duration_select", "selected_option")
-        or "1.0"
+        _hours_to_option_value(entries[0].hours) if entries else DEFAULT_ENTRY_DURATION
     )
 
     entries_by_project: dict[str, list[jm.LogEntry]] = defaultdict(list)
@@ -912,6 +993,7 @@ def handle_logtime_submission(ack, body, client, view):
                         task=entry.task,
                         category=entry.category,
                         activity=entry.activity,
+                        hours=_hours_to_option_value(entry.hours),
                     )
                     for entry in entries
                 ],

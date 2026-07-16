@@ -44,8 +44,8 @@ def build_hourly_reminder_blocks() -> list[dict]:
                 {
                     "type": "mrkdwn",
                     "text": (
-                        "Duration options: 1.0 hr, 0.5 hr, or 0.25 hr per entry. "
-                        "Entries update your Google Doc journal and weekly summary."
+                        "Choose hours per entry (defaults to 1.0 hr). "
+                        "Empty slots are treated as Break and not written to the journal."
                     ),
                 }
             ],
