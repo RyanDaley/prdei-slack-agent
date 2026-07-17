@@ -57,7 +57,13 @@ def _firestore_category_labels() -> dict[str, str]:
     try:
         import firestore_store
 
-        return {item.id: item.name for item in firestore_store.list_categories()}
+        labels = {item.id: item.name for item in firestore_store.list_categories()}
+        # Also map bare slugs from legacy entries (last segment after __).
+        for task_id, name in list(labels.items()):
+            if "__" in task_id:
+                slug = task_id.rsplit("__", 1)[-1]
+                labels.setdefault(slug, name)
+        return labels
     except Exception:
         return {}
 
@@ -99,6 +105,8 @@ class LogEntry:
 
     @property
     def category_label(self) -> str:
+        if not self.category:
+            return ""
         labels = category_labels_map()
         return labels.get(self.category, self.category.replace("_", " ").title())
 

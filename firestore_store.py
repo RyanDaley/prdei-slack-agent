@@ -2,9 +2,12 @@
 Firestore data store for Projects, Tasks, Categories, Users, and time logs.
 
 Collections (document ID = Slack-friendly key, except users use slack_user_id):
-  projects/{id}     { name, drive_folder_url, start_date, estimated_end_date }
+  projects/{id}     { name, drive_folder_url, start_date, estimated_end_date,
+                      activity_log_spreadsheet_id?, period_document_id?,
+                      period_document_title? }
   tasks/{id}        { name, project_id, completed, estimated, avg_weekly_spend }
-  categories/{id}   { name, completed, estimated }
+  categories/{id}   { name, task_id, completed, estimated }
+                    # id = {task_id}__{slug}; each task has its own category set
   users/{slack_id}  { slack_user_id, display_name, timesheet_folder_url, email, rate,
                       last_logtime? }   # last_logtime = Slack form PREFILL only (overwrites)
                       # last_logtime.prefill_rows = last modal rows (NOT history)
@@ -60,6 +63,9 @@ class ProjectRecord:
     drive_folder_url: str = ""
     start_date: str = DEFAULT_PROJECT_START_DATE
     estimated_end_date: str = DEFAULT_PROJECT_END_DATE
+    activity_log_spreadsheet_id: str = ""
+    period_document_id: str = ""
+    period_document_title: str = ""
 
 
 @dataclass
@@ -82,6 +88,7 @@ class TaskRecord:
 class CategoryRecord:
     id: str
     name: str
+    task_id: str = ""
     completed: int = 0
     estimated: int = 0
 
@@ -214,6 +221,9 @@ def _project_from_doc(doc) -> ProjectRecord:
         estimated_end_date=normalize_project_date(
             data.get("estimated_end_date") or DEFAULT_PROJECT_END_DATE
         ),
+        activity_log_spreadsheet_id=str(data.get("activity_log_spreadsheet_id") or ""),
+        period_document_id=str(data.get("period_document_id") or ""),
+        period_document_title=str(data.get("period_document_title") or ""),
     )
 
 
@@ -254,7 +264,45 @@ def upsert_project(
         estimated_end_date=normalize_project_date(
             payload.get("estimated_end_date") or ""
         ),
+        activity_log_spreadsheet_id=str(
+            (snap.to_dict() or {}).get("activity_log_spreadsheet_id") or ""
+        )
+        if snap.exists
+        else "",
+        period_document_id=str(
+            (snap.to_dict() or {}).get("period_document_id") or ""
+        )
+        if snap.exists
+        else "",
+        period_document_title=str(
+            (snap.to_dict() or {}).get("period_document_title") or ""
+        )
+        if snap.exists
+        else "",
     )
+
+
+def set_project_drive_assets(
+    project_id: str,
+    *,
+    activity_log_spreadsheet_id: str | None = None,
+    period_document_id: str | None = None,
+    period_document_title: str | None = None,
+) -> None:
+    """Persist resolved Drive file IDs so ensure_* reuses them instead of creating dupes."""
+    project_id = (project_id or "").strip()
+    if not project_id:
+        return
+    payload: dict = {}
+    if activity_log_spreadsheet_id is not None:
+        payload["activity_log_spreadsheet_id"] = (activity_log_spreadsheet_id or "").strip()
+    if period_document_id is not None:
+        payload["period_document_id"] = (period_document_id or "").strip()
+    if period_document_title is not None:
+        payload["period_document_title"] = (period_document_title or "").strip()
+    if not payload:
+        return
+    get_db().collection(COL_PROJECTS).document(project_id).set(payload, merge=True)
 
 
 def set_project_schedule(
@@ -408,6 +456,11 @@ def task_doc_id(project_id: str, task_slug: str) -> str:
     return f"{project_id}__{task_slug}"
 
 
+def category_doc_id(task_id: str, category_slug: str) -> str:
+    """Stable unique id so the same category name can exist on many tasks."""
+    return f"{task_id}__{category_slug}"
+
+
 def _task_from_doc(doc) -> TaskRecord:
     data = doc.to_dict() or {}
     return TaskRecord(
@@ -427,6 +480,7 @@ def _category_from_doc(doc) -> CategoryRecord:
     return CategoryRecord(
         id=doc.id,
         name=str(data.get("name") or doc.id),
+        task_id=str(data.get("task_id") or "").strip(),
         completed=_as_int(data.get("completed")),
         estimated=_as_int(data.get("estimated")),
     )
@@ -457,10 +511,36 @@ def list_tasks(project_id: str | None = None) -> list[TaskRecord]:
     return sorted(items, key=lambda t: t.name.lower())
 
 
-def list_categories() -> list[CategoryRecord]:
-    docs = get_db().collection(COL_CATEGORIES).stream()
+def list_categories(task_id: str | None = None) -> list[CategoryRecord]:
+    """
+    List categories. When task_id is set, only that task's categories.
+    When None, return all categories (for label maps / migration).
+    """
+    coll = get_db().collection(COL_CATEGORIES)
+    if task_id:
+        docs = coll.where("task_id", "==", task_id).stream()
+    else:
+        docs = coll.stream()
     items = [_category_from_doc(doc) for doc in docs]
+    if task_id:
+        items = [c for c in items if c.task_id == task_id]
     return sorted(items, key=lambda c: c.name.lower())
+
+
+def list_categories_for_project(project_id: str) -> list[CategoryRecord]:
+    """All categories belonging to any task on this project."""
+    project_id = (project_id or "").strip()
+    if not project_id:
+        return []
+    out: list[CategoryRecord] = []
+    seen: set[str] = set()
+    for task in list_tasks(project_id):
+        for cat in list_categories(task.id):
+            if cat.id in seen:
+                continue
+            seen.add(cat.id)
+            out.append(cat)
+    return sorted(out, key=lambda c: (c.task_id.lower(), c.name.lower()))
 
 
 def get_task(task_id: str) -> Optional[TaskRecord]:
@@ -523,11 +603,15 @@ def upsert_task(
 def upsert_category(
     category_id: str,
     name: str,
+    task_id: str,
     *,
     completed: int | None = None,
     estimated: int | None = None,
 ) -> CategoryRecord:
-    payload: dict = {"name": name.strip()}
+    payload: dict = {
+        "name": name.strip(),
+        "task_id": (task_id or "").strip(),
+    }
     if completed is not None:
         payload["completed"] = _as_int(completed)
     if estimated is not None:
@@ -541,6 +625,7 @@ def upsert_category(
     return get_category(category_id) or CategoryRecord(
         id=category_id,
         name=payload["name"],
+        task_id=payload["task_id"],
         completed=_as_int(payload.get("completed")),
         estimated=_as_int(payload.get("estimated")),
     )
@@ -578,15 +663,18 @@ def create_task(name: str, project_id: str) -> TaskRecord:
     )
 
 
-def create_category(name: str) -> CategoryRecord:
+def create_category(name: str, task_id: str) -> CategoryRecord:
+    task_id = (task_id or "").strip()
+    if not task_id:
+        raise ValueError("task_id is required to create a category")
     base = slugify(name)
-    category_id = base
+    category_id = category_doc_id(task_id, base)
     coll = get_db().collection(COL_CATEGORIES)
     suffix = 2
     while coll.document(category_id).get().exists:
-        category_id = f"{base}_{suffix}"
+        category_id = category_doc_id(task_id, f"{base}_{suffix}")
         suffix += 1
-    return upsert_category(category_id, name, completed=0, estimated=0)
+    return upsert_category(category_id, name, task_id, completed=0, estimated=0)
 
 
 def set_task_estimated(task_id: str, estimated: int) -> None:
@@ -724,6 +812,58 @@ def sync_project_task_budget(
                 flush=True,
             )
     return written
+
+
+def ensure_task_categories() -> dict[str, int]:
+    """
+    Idempotent migration: copy legacy global categories (no task_id) onto each
+    task that has no scoped categories yet, then delete the legacy docs.
+
+    Does not create default categories for new tasks — each task starts empty
+    and gets categories via Slack (+) or create_category.
+    """
+    tasks = list_tasks()
+    all_docs = list(get_db().collection(COL_CATEGORIES).stream())
+    all_cats = [_category_from_doc(doc) for doc in all_docs]
+    legacy = [c for c in all_cats if not c.task_id]
+    scoped_by_task: dict[str, list[CategoryRecord]] = {}
+    for cat in all_cats:
+        if cat.task_id:
+            scoped_by_task.setdefault(cat.task_id, []).append(cat)
+
+    migrated = 0
+    for task in tasks:
+        if scoped_by_task.get(task.id):
+            continue
+        if not legacy:
+            continue
+        for lc in legacy:
+            slug = slugify(lc.name) or slugify(lc.id) or "category"
+            if re.fullmatch(r"[a-z0-9_]+", lc.id) and "__" not in lc.id:
+                slug = lc.id
+            upsert_category(
+                category_doc_id(task.id, slug),
+                lc.name,
+                task.id,
+                completed=lc.completed,
+                estimated=lc.estimated,
+            )
+            migrated += 1
+
+    deleted = 0
+    if migrated or (legacy and not tasks):
+        for lc in legacy:
+            get_db().collection(COL_CATEGORIES).document(lc.id).delete()
+            deleted += 1
+
+    result = {
+        "tasks": len(tasks),
+        "migrated": migrated,
+        "deleted_legacy": deleted,
+    }
+    if migrated or deleted:
+        print(f"[FIRESTORE] ensure_task_categories: {result}", flush=True)
+    return result
 
 
 def ensure_project_tasks() -> dict[str, int]:
@@ -1033,20 +1173,26 @@ def _resolve_log_task(entry) -> tuple[str, str]:
 
 
 def _resolve_log_category(entry) -> tuple[str, str]:
-    """Return (category_id, category_display_name)."""
+    """Return (category_id, category_display_name). Empty when category is optional/blank."""
     category_id = str(getattr(entry, "category", "") or "").strip()
+    if category_id.startswith("_"):
+        # Slack placeholders: _none, _need_task, _no_categories
+        return "", ""
     category_name = ""
     if hasattr(entry, "category_label"):
         try:
             category_name = str(entry.category_label or "").strip()
         except Exception:
             category_name = ""
-    if not category_name:
-        category_name = category_id.replace("_", " ").title() if category_id else ""
+    if not category_name and category_id:
+        category_name = category_id.replace("_", " ").title()
     if category_id:
         existing = get_category(category_id)
         if existing:
             category_name = existing.name or category_name
+        else:
+            # Unknown / cleared — do not invent a category.
+            return "", ""
     return category_id, category_name
 
 
@@ -1226,8 +1372,9 @@ def collection_is_empty(collection: str) -> bool:
 
 def seed_if_empty() -> dict[str, int]:
     """
-    Seed default Projects / Categories / User when collections are empty,
-    then ensure every project has its own task set.
+    Seed default Projects / User when collections are empty,
+    migrate legacy global tasks/categories onto projects/tasks,
+    then ensure money/schedule fields exist.
     Safe to call on every startup.
     """
     import project_router
@@ -1250,13 +1397,8 @@ def seed_if_empty() -> dict[str, int]:
             seeded["projects"] += 1
 
     if collection_is_empty(COL_CATEGORIES):
-        for cat_id, name in [
-            ("cad_modeling", "CAD / BIM Modeling"),
-            ("permitting", "Permitting / Code Review"),
-            ("engineering", "Engineering / Calcs"),
-        ]:
-            upsert_named(COL_CATEGORIES, cat_id, name)
-            seeded["categories"] += 1
+        # No global category seed — categories are created per task via Slack (+).
+        pass
 
     if collection_is_empty(COL_USERS):
         slack_id = os.environ.get("REMINDER_USER_ID", "").strip()
@@ -1278,6 +1420,8 @@ def seed_if_empty() -> dict[str, int]:
 
     task_stats = ensure_project_tasks()
     seeded["tasks"] = int(task_stats.get("migrated") or 0)
+    cat_stats = ensure_task_categories()
+    seeded["categories"] = int(cat_stats.get("migrated") or 0)
     ensure_user_rates()
     ensure_task_money_fields()
     ensure_project_schedule_fields()
@@ -1289,7 +1433,7 @@ def seed_if_empty() -> dict[str, int]:
             flush=True,
         )
 
-    if any(v for k, v in seeded.items() if k != "tasks") or task_stats.get("migrated"):
+    if any(v for k, v in seeded.items() if k not in {"tasks", "categories"}) or task_stats.get("migrated") or cat_stats.get("migrated"):
         print(f"[FIRESTORE] Seeded defaults: {seeded}", flush=True)
     else:
         print("[FIRESTORE] Collections already seeded — skip.", flush=True)

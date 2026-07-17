@@ -5,7 +5,9 @@ Firestore is the source of truth for logged activity (time_logs) and task
 Completed $ / Avg Weekly Spend. Sheets are a working view:
   - ActivityLog rows (written from Slack for the weekly narrative/chart)
   - Dashboard: week rollups + PM-edited Estimated $ / project dates
-  - Task Budget Completed / Avg Weekly Spend are filled from Firestore
+  - Category/Task Budget Completed $ are SUMIF(S) from ActivityLog
+    (task total = sum of its categories + uncategorized logs)
+  - Avg Weekly Spend is filled from Firestore Completed $
 
 Per-project sheets live in the project Drive folder and are named
 "Detailed Activity Log" (see project_router.ensure_project_assets).
@@ -22,6 +24,7 @@ from googleapiclient.discovery import build
 import firestore_store
 import journal_models as jm
 import project_router
+import sheets_quota
 
 SHEETS_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -86,8 +89,55 @@ def _ensure_tab(sheets, spreadsheet_id: str, title: str) -> None:
     ).execute()
 
 
+def _sheet_str_literal(value: str) -> str:
+    """Escape a string for use inside a Sheets formula."""
+    return '"' + str(value).replace('"', '""') + '"'
+
+
 def _category_labels() -> list[str]:
+    """Legacy helper — prefer _category_labels_for_project when project is known."""
     return list(jm.category_labels_map().values())
+
+
+def _category_budget_items(
+    project_key: str = "",
+) -> list[tuple[str, str, str]]:
+    """
+    Category Budget rows for a project.
+    Returns [(display_label, task_name, category_name), ...].
+    Display uses "Task / Category" when the same category name exists on
+    more than one task in the project.
+    """
+    project_key = (project_key or "").strip()
+    if not project_key:
+        return [(name, "", name) for name in _category_labels()]
+    try:
+        cats = firestore_store.list_categories_for_project(project_key)
+        counts: dict[str, int] = {}
+        for c in cats:
+            counts[c.name] = counts.get(c.name, 0) + 1
+        task_names = {t.id: t.name for t in firestore_store.list_tasks(project_key)}
+        items: list[tuple[str, str, str]] = []
+        seen: set[str] = set()
+        for c in cats:
+            task_name = task_names.get(c.task_id) or ""
+            if counts[c.name] > 1 and task_name:
+                label = f"{task_name} / {c.name}"
+            else:
+                label = c.name
+            if label in seen:
+                continue
+            seen.add(label)
+            items.append((label, task_name, c.name))
+        return items
+    except Exception as exc:
+        print(f"  [SHEETS WARNING] Could not list project categories: {exc}", flush=True)
+        return []
+
+
+def _category_labels_for_project(project_key: str = "") -> list[str]:
+    """Display names of categories belonging to this project's tasks."""
+    return [label for label, _task, _cat in _category_budget_items(project_key)]
 
 
 def _task_labels_for_project(
@@ -328,6 +378,30 @@ def refresh_dashboard_tables(
     spreadsheet_id: str,
     *,
     project_key: str = "",
+    autosize: bool = True,
+) -> None:
+    """
+    Rebuild Dashboard tables from ActivityLog + Firestore.
+
+    autosize=False skips column autosize (saves read quota on Slack write paths).
+    """
+    sheets_quota.call_with_retry(
+        lambda: _refresh_dashboard_tables_impl(
+            sheets,
+            spreadsheet_id,
+            project_key=project_key,
+            autosize=autosize,
+        ),
+        label="refresh_dashboard",
+    )
+
+
+def _refresh_dashboard_tables_impl(
+    sheets,
+    spreadsheet_id: str,
+    *,
+    project_key: str = "",
+    autosize: bool = True,
 ) -> None:
     """
     Rebuild Dashboard:
@@ -392,8 +466,11 @@ def refresh_dashboard_tables(
                 fs_task_est[task.name] = task.estimated
                 fs_task_completed[task.name] = int(task.completed or 0)
                 fs_task_avg[task.name] = int(task.avg_weekly_spend or 0)
-        for cat in firestore_store.list_categories():
+        for cat in firestore_store.list_categories_for_project(project_key) if project_key else []:
             fs_cat_est[cat.name] = cat.estimated
+        if not project_key:
+            for cat in firestore_store.list_categories():
+                fs_cat_est[cat.name] = cat.estimated
     except Exception as exc:
         print(f"  [SHEETS WARNING] Firestore lookup failed: {exc}", flush=True)
 
@@ -483,7 +560,8 @@ def refresh_dashboard_tables(
         key=lambda kv: (kv[0][0].lower(), kv[0][1].lower(), kv[0][2].lower()),
     )
 
-    category_labels = _category_labels()
+    category_items = _category_budget_items(project_key)
+    category_labels = [label for label, _task, _cat in category_items]
     task_labels = _task_labels_for_project(
         project_key, activity_task_names=seen_tasks
     )
@@ -532,23 +610,45 @@ def refresh_dashboard_tables(
         values.append(["(no entries this week)", "", "", 0, 0])
 
     values.append([""])
-    values.append(["Category Budget (edit Estimated $ manually)", "", "", ""])
+    values.append(
+        [
+            "Category Budget (Completed $ = Activity Log for that task+category)",
+            "",
+            "",
+            "",
+        ]
+    )
     cat_header_row = len(values) + 1  # 1-based sheet row of next append
     values.append(["Category", "Hours", "Completed ($)", "Estimated ($)"])
-    for offset, label in enumerate(category_labels):
+    for offset, (label, task_name, cat_name) in enumerate(category_items):
         row_num = cat_header_row + 1 + offset
-        hours_f = (
-            f"=IFERROR(SUMIFS({ACTIVITY_TAB}!C:C,"
-            f"{ACTIVITY_TAB}!E:E,A{row_num},"
-            f"{ACTIVITY_TAB}!G:G,$B$1),0)"
-        )
-        completed_f = (
-            f"=IFERROR(SUMIFS({ACTIVITY_TAB}!I:I,"
-            f"{ACTIVITY_TAB}!E:E,A{row_num},"
-            f"{ACTIVITY_TAB}!G:G,$B$1),0)"
-        )
-        estimate = prior_cat.get(label, "")
-        if estimate in ("", None) and label in fs_cat_est and fs_cat_est[label]:
+        # Lifetime totals scoped to the owning task so duplicate category names
+        # across tasks do not mix. Sum of a task's categories (+ blank category
+        # rows) equals that task's Task Budget Completed $.
+        cat_lit = _sheet_str_literal(cat_name)
+        if task_name:
+            task_lit = _sheet_str_literal(task_name)
+            hours_f = (
+                f"=IFERROR(SUMIFS({ACTIVITY_TAB}!C:C,"
+                f"{ACTIVITY_TAB}!D:D,{task_lit},"
+                f"{ACTIVITY_TAB}!E:E,{cat_lit}),0)"
+            )
+            completed_f = (
+                f"=IFERROR(SUMIFS({ACTIVITY_TAB}!I:I,"
+                f"{ACTIVITY_TAB}!D:D,{task_lit},"
+                f"{ACTIVITY_TAB}!E:E,{cat_lit}),0)"
+            )
+        else:
+            hours_f = (
+                f"=IFERROR(SUMIF({ACTIVITY_TAB}!E:E,{cat_lit},{ACTIVITY_TAB}!C:C),0)"
+            )
+            completed_f = (
+                f"=IFERROR(SUMIF({ACTIVITY_TAB}!E:E,{cat_lit},{ACTIVITY_TAB}!I:I),0)"
+            )
+        estimate = prior_cat.get(label, "") or prior_cat.get(cat_name, "")
+        if estimate in ("", None) and cat_name in fs_cat_est and fs_cat_est[cat_name]:
+            estimate = fs_cat_est[cat_name]
+        elif estimate in ("", None) and label in fs_cat_est and fs_cat_est[label]:
             estimate = fs_cat_est[label]
         values.append([label, hours_f, completed_f, estimate])
 
@@ -575,15 +675,18 @@ def refresh_dashboard_tables(
             hours_f = (
                 f"=IFERROR(SUMIF({ACTIVITY_TAB}!D:D,A{row_num},{ACTIVITY_TAB}!C:C),0)"
             )
-            # Completed $ from Firestore (Slack → time_logs → Task.completed)
-            completed_val = int(fs_task_completed.get(label, 0) or 0)
+            # Lifetime Completed $ from Activity Log (= sum of that task's
+            # categorized + uncategorized rows).
+            completed_f = (
+                f"=IFERROR(SUMIF({ACTIVITY_TAB}!D:D,A{row_num},{ACTIVITY_TAB}!I:I),0)"
+            )
             remaining_f = f"=MAX(0,D{row_num}-C{row_num})"
             estimate = prior_task.get(label, "")
             if estimate in ("", None) and label in fs_task_est and fs_task_est[label]:
                 estimate = fs_task_est[label]
             avg_spend = avg_weekly_by_task.get(label, 0) or ""
             values.append(
-                [label, hours_f, completed_val, estimate, remaining_f, avg_spend]
+                [label, hours_f, completed_f, estimate, remaining_f, avg_spend]
             )
 
     # Clear old dashboard content then write
@@ -651,11 +754,12 @@ def refresh_dashboard_tables(
         )
 
     _apply_dashboard_formatting(sheets, spreadsheet_id, values)
-    _autosize_dashboard_columns(sheets, spreadsheet_id)
-    try:
-        _autosize_activity_log_columns(sheets, spreadsheet_id)
-    except Exception as exc:
-        print(f"  [SHEETS WARNING] ActivityLog autosize failed: {exc}", flush=True)
+    if autosize:
+        _autosize_dashboard_columns(sheets, spreadsheet_id)
+        try:
+            _autosize_activity_log_columns(sheets, spreadsheet_id)
+        except Exception as exc:
+            print(f"  [SHEETS WARNING] ActivityLog autosize failed: {exc}", flush=True)
 
 
 def _dashboard_sheet_id(sheets, spreadsheet_id: str) -> int:
@@ -1006,12 +1110,34 @@ def _sync_estimates_to_firestore(
             estimates[f"{mode}:{head}"] = _as_money(raw)
 
     try:
-        cat_by_name = {c.name: c for c in firestore_store.list_categories()}
+        cats = (
+            firestore_store.list_categories_for_project(project_key)
+            if project_key
+            else firestore_store.list_categories()
+        )
+        task_names = (
+            {t.id: t.name for t in firestore_store.list_tasks(project_key)}
+            if project_key
+            else {}
+        )
+        cat_by_name: dict[str, object] = {}
+        cat_by_task_and_name: dict[tuple[str, str], object] = {}
+        for c in cats:
+            cat_by_name[c.name] = c
+            tname = task_names.get(getattr(c, "task_id", ""), "")
+            if tname:
+                cat_by_task_and_name[(tname, c.name)] = c
         for label in category_labels:
             est = estimates.get(f"category:{label}")
             if est is None:
                 continue
-            cat = cat_by_name.get(label)
+            cat = None
+            if " / " in label:
+                task_part, cat_part = label.split(" / ", 1)
+                cat = cat_by_task_and_name.get((task_part, cat_part))
+            if cat is None:
+                lookup = label.split(" / ", 1)[-1] if " / " in label else label
+                cat = cat_by_name.get(lookup) or cat_by_name.get(label)
             if cat and cat.estimated != est:
                 firestore_store.set_category_estimated(cat.id, est)
         if project_key:
@@ -1363,8 +1489,9 @@ def ensure_spreadsheet(
     if not header:
         _write_headers_and_dashboard(sheets, spreadsheet_id, project_key=project_key)
     else:
+        # Headers only — do not rebuild the Dashboard here. Callers that write
+        # ActivityLog should refresh once after the write (quota-sensitive).
         _ensure_activity_headers(sheets, spreadsheet_id)
-        refresh_dashboard_tables(sheets, spreadsheet_id, project_key=project_key)
     return spreadsheet_id
 
 
@@ -1383,16 +1510,32 @@ def update_dashboard_week(
     week_label: str,
     sheets=None,
     project_key: str = "",
+    *,
+    refresh: bool = False,
 ) -> None:
+    """
+    Write Week Start / Week Of on the Dashboard.
+
+    refresh=False by default so Slack log paths can update the week cells
+    cheaply and call refresh_dashboard_tables once after ActivityLog writes.
+    """
     sheets = sheets or get_sheets_service()
     week_start_date = week_start.date().isoformat()
-    sheets.spreadsheets().values().update(
-        spreadsheetId=spreadsheet_id,
-        range=f"{DASHBOARD_TAB}!B1:B2",
-        valueInputOption="USER_ENTERED",
-        body={"values": [[week_start_date], [week_label]]},
-    ).execute()
-    refresh_dashboard_tables(sheets, spreadsheet_id, project_key=project_key)
+    sheets_quota.execute_with_retry(
+        sheets.spreadsheets()
+        .values()
+        .update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{DASHBOARD_TAB}!B1:B2",
+            valueInputOption="USER_ENTERED",
+            body={"values": [[week_start_date], [week_label]]},
+        ),
+        label="update_dashboard_week",
+    )
+    if refresh:
+        refresh_dashboard_tables(
+            sheets, spreadsheet_id, project_key=project_key, autosize=False
+        )
 
 
 def append_log_entries(
@@ -1456,11 +1599,14 @@ def append_log_entries(
 
     to_append: list[list] = []
     for entry in entries:
-        task_label = entry.task_label
-        category_label = entry.category_label
+        task_label = entry.task_label or ""
+        # Always reserve the Category cell (blank when optional/unset) so Activity
+        # never shifts left into the Category column.
+        category_label = str(entry.category_label or "")
+        activity_text = str(entry.activity or "")
         amount = int(round(float(entry.hours) * rate))
         match_row = _find_match_row(
-            entry.user, task_label, category_label, entry.activity
+            entry.user, task_label, category_label, activity_text
         )
         if match_row is None:
             row = [
@@ -1469,7 +1615,7 @@ def append_log_entries(
                 entry.hours,
                 task_label,
                 category_label,
-                entry.activity,
+                activity_text,
                 week_start_date,
                 rate,
                 amount,
@@ -1503,7 +1649,7 @@ def append_log_entries(
                         new_hours,
                         task_label,
                         category_label,
-                        entry.activity,
+                        activity_text,
                         week_start_date,
                         row_rate,
                         new_amount,
@@ -1517,7 +1663,7 @@ def append_log_entries(
             new_hours,
             task_label,
             category_label,
-            entry.activity,
+            activity_text,
             week_start_date,
             row_rate,
             new_amount,
@@ -1537,7 +1683,9 @@ def append_log_entries(
             body={"values": to_append},
         ).execute()
 
-    refresh_dashboard_tables(sheets, spreadsheet_id, project_key=project_key)
+    refresh_dashboard_tables(
+        sheets, spreadsheet_id, project_key=project_key, autosize=False
+    )
     return True
 
 

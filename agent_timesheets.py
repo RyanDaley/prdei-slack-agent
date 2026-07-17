@@ -23,14 +23,32 @@ from googleapiclient.discovery import build
 import employee_router
 import journal_models as jm
 import project_router
+import sheets_quota
 
 TIMESHEET_TAB = "Timesheet"
 HEADER_ROW = 5
 DATA_START_ROW = 6
 
-# Day columns for Sun..Sat
+# Layout: A Project | B Task | C Category | D Activity | E..K Sun..Sat | L Total
 DAY_COLUMNS = ["E", "F", "G", "H", "I", "J", "K"]  # Sun..Sat
 TOTAL_COLUMN = "L"
+LAST_DATA_COLUMN = "L"
+NUM_COLUMNS = 12  # A..L
+
+TIMESHEET_HEADERS = [
+    "Project",
+    "Task",
+    "Category",
+    "Activity",
+    "Sun",
+    "Mon",
+    "Tue",
+    "Wed",
+    "Thurs",
+    "Fri",
+    "Sat",
+    "Total",
+]
 
 SHEETS_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -53,8 +71,8 @@ def get_sheets_service():
 
 
 def _weekday_column(when: datetime) -> str:
-    """Map local timestamp to Sun..Sat column letter."""
-    # Python: Mon=0 .. Sun=6  →  Sun=E, Mon=F, ... Sat=K
+    """Map local timestamp to Sun..Sat column letter (E..K)."""
+    # Python: Mon=0 .. Sun=6
     mapping = {
         6: "E",  # Sunday
         0: "F",
@@ -148,7 +166,7 @@ def _apply_timesheet_formatting(
         widths_px = [
             160,  # Project
             180,  # Task
-            160,  # Category
+            140,  # Category
             360,  # Activity
             56,   # Sun
             56,   # Mon
@@ -174,7 +192,7 @@ def _apply_timesheet_formatting(
                     }
                 }
             )
-    # Wrap Activity column (D = index 3) so each logged line appears on its own row visually.
+    # Wrap Activity column (D = index 3).
     requests.append(
         {
             "repeatCell": {
@@ -203,7 +221,7 @@ def _apply_timesheet_formatting(
                     "startRowIndex": HEADER_ROW - 1,
                     "endRowIndex": HEADER_ROW,
                     "startColumnIndex": 0,
-                    "endColumnIndex": 12,
+                    "endColumnIndex": NUM_COLUMNS,
                 },
                 "cell": {
                     "userEnteredFormat": {
@@ -261,8 +279,8 @@ def _apply_timesheet_formatting(
                     "sheetId": sheet_id,
                     "startRowIndex": 3,
                     "endRowIndex": 4,
-                    "startColumnIndex": 0,
-                    "endColumnIndex": 12,
+                    "startColumnIndex": 4,
+                    "endColumnIndex": NUM_COLUMNS,
                 },
                 "cell": {
                     "userEnteredFormat": {
@@ -302,7 +320,7 @@ def _autosize_timesheet_columns(
                             "sheetId": sheet_id,
                             "dimension": "COLUMNS",
                             "startIndex": 0,
-                            "endIndex": 12,  # A..L
+                            "endIndex": NUM_COLUMNS,  # A..L
                         }
                     }
                 }
@@ -316,7 +334,7 @@ def _autosize_timesheet_columns(
         .values()
         .get(
             spreadsheetId=spreadsheet_id,
-            range=f"{TIMESHEET_TAB}!A2:L",
+            range=f"{TIMESHEET_TAB}!A2:{LAST_DATA_COLUMN}",
             valueRenderOption="FORMATTED_VALUE",
         )
         .execute()
@@ -326,11 +344,11 @@ def _autosize_timesheet_columns(
     # Approx px/char for Sheets default font; Activity capped so wrap can work.
     px_per_char = 7.2
     floors = [80, 80, 80, 160, 48, 48, 48, 48, 56, 48, 48, 56]
-    ceilings = [280, 280, 240, 480, 90, 90, 90, 90, 96, 90, 90, 96]
-    max_lens = [0] * 12
+    ceilings = [280, 280, 220, 480, 90, 90, 90, 90, 96, 90, 90, 96]
+    max_lens = [0] * NUM_COLUMNS
     for row in values:
-        padded = list(row) + [""] * (12 - len(row))
-        for col_idx, cell in enumerate(padded[:12]):
+        padded = list(row) + [""] * (NUM_COLUMNS - len(row))
+        for col_idx, cell in enumerate(padded[:NUM_COLUMNS]):
             for line in str(cell or "").replace("\r\n", "\n").split("\n"):
                 max_lens[col_idx] = max(max_lens[col_idx], len(line.strip()))
 
@@ -364,6 +382,86 @@ def _autosize_timesheet_columns(
     )
 
 
+def _ensure_category_column(
+    sheets, spreadsheet_id: str, header: list[str] | None = None
+) -> list[str]:
+    """
+    Migrate legacy Project|Task|Activity|Sun… layout by inserting Category at C.
+    Existing Activity values shift into column D.
+    Returns the current header row (after migration if needed).
+    """
+    if header is None:
+        header_row = sheets_quota.execute_with_retry(
+            sheets.spreadsheets()
+            .values()
+            .get(spreadsheetId=spreadsheet_id, range=f"{TIMESHEET_TAB}!A5:L5"),
+            label="timesheet_header",
+        ).get("values") or []
+        header = [str(c).strip() for c in (header_row[0] if header_row else [])]
+    else:
+        header = [str(c).strip() for c in header]
+
+    if not header or "Project" not in header:
+        return header
+    if "Category" in header:
+        return header
+    if "Activity" not in header:
+        return header
+
+    sheet_id = _timesheet_sheet_id(sheets, spreadsheet_id)
+    # Insert before Activity (column index 2).
+    sheets_quota.execute_with_retry(
+        sheets.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "requests": [
+                    {
+                        "insertDimension": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "dimension": "COLUMNS",
+                                "startIndex": 2,
+                                "endIndex": 3,
+                            },
+                            "inheritFromBefore": False,
+                        }
+                    }
+                ]
+            },
+        ),
+        label="timesheet_insert_category",
+    )
+    sheets_quota.execute_with_retry(
+        sheets.spreadsheets()
+        .values()
+        .update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{TIMESHEET_TAB}!A5:L5",
+            valueInputOption="RAW",
+            body={"values": [TIMESHEET_HEADERS]},
+        ),
+        label="timesheet_write_headers",
+    )
+    # Day-date formulas move to E4:K4 after the insert.
+    sheets_quota.execute_with_retry(
+        sheets.spreadsheets()
+        .values()
+        .update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{TIMESHEET_TAB}!E4:K4",
+            valueInputOption="USER_ENTERED",
+            body={
+                "values": [
+                    ["=B3-6", "=B3-5", "=B3-4", "=B3-3", "=B3-2", "=B3-1", "=B3"]
+                ]
+            },
+        ),
+        label="timesheet_day_formulas",
+    )
+    print(f"  [TIMESHEET] Inserted Category column on {spreadsheet_id}", flush=True)
+    return list(TIMESHEET_HEADERS)
+
+
 def ensure_timesheet_layout(
     spreadsheet_id: str,
     employee_name: str,
@@ -374,28 +472,32 @@ def ensure_timesheet_layout(
     sheets = sheets or get_sheets_service()
     _ensure_timesheet_tab(sheets, spreadsheet_id)
 
-    probe = (
+    probe = sheets_quota.execute_with_retry(
         sheets.spreadsheets()
         .values()
-        .get(spreadsheetId=spreadsheet_id, range=f"{TIMESHEET_TAB}!A5:L5")
-        .execute()
-        .get("values")
-        or []
-    )
-    has_headers = bool(probe) and "Project" in (probe[0] or [])
+        .get(spreadsheetId=spreadsheet_id, range=f"{TIMESHEET_TAB}!A5:L5"),
+        label="timesheet_probe_headers",
+    ).get("values") or []
+    header = [str(c).strip() for c in (probe[0] if probe else [])]
+    has_headers = bool(header) and "Project" in header
 
     # Always refresh name / week ending.
-    sheets.spreadsheets().values().update(
-        spreadsheetId=spreadsheet_id,
-        range=f"{TIMESHEET_TAB}!A2:B3",
-        valueInputOption="USER_ENTERED",
-        body={
-            "values": [
-                ["Employee Name:", "Week Ending:"],
-                [employee_name, week_ending.isoformat()],
-            ]
-        },
-    ).execute()
+    sheets_quota.execute_with_retry(
+        sheets.spreadsheets()
+        .values()
+        .update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{TIMESHEET_TAB}!A2:B3",
+            valueInputOption="USER_ENTERED",
+            body={
+                "values": [
+                    ["Employee Name:", "Week Ending:"],
+                    [employee_name, week_ending.isoformat()],
+                ]
+            },
+        ),
+        label="timesheet_name_week",
+    )
 
     if not has_headers:
         # Row 4 day-date formulas relative to week ending (Sat) in B3.
@@ -403,53 +505,61 @@ def ensure_timesheet_layout(
         day_formulas = [
             ["=B3-6", "=B3-5", "=B3-4", "=B3-3", "=B3-2", "=B3-1", "=B3"],
         ]
-        sheets.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range=f"{TIMESHEET_TAB}!E4:K4",
-            valueInputOption="USER_ENTERED",
-            body={"values": day_formulas},
-        ).execute()
+        sheets_quota.execute_with_retry(
+            sheets.spreadsheets()
+            .values()
+            .update(
+                spreadsheetId=spreadsheet_id,
+                range=f"{TIMESHEET_TAB}!E4:K4",
+                valueInputOption="USER_ENTERED",
+                body={"values": day_formulas},
+            ),
+            label="timesheet_init_days",
+        )
 
-        headers = [
-            [
-                "Project",
-                "Task",
-                "Category",
-                "Activity",
-                "Sun",
-                "Mon",
-                "Tue",
-                "Wed",
-                "Thurs",
-                "Fri",
-                "Sat",
-                "Total",
-            ]
-        ]
-        sheets.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range=f"{TIMESHEET_TAB}!A5:L5",
-            valueInputOption="RAW",
-            body={"values": headers},
-        ).execute()
+        sheets_quota.execute_with_retry(
+            sheets.spreadsheets()
+            .values()
+            .update(
+                spreadsheetId=spreadsheet_id,
+                range=f"{TIMESHEET_TAB}!A5:L5",
+                valueInputOption="RAW",
+                body={"values": [TIMESHEET_HEADERS]},
+            ),
+            label="timesheet_init_headers",
+        )
         print(f"  [TIMESHEET] Initialized layout on {spreadsheet_id}")
         _apply_timesheet_formatting(
             sheets, spreadsheet_id, include_starter_widths=True
         )
-    else:
-        _apply_timesheet_formatting(sheets, spreadsheet_id)
+        return
+
+    header = _ensure_category_column(sheets, spreadsheet_id, header=header)
+    # Only rewrite headers when they drift from the canonical layout.
+    if header != TIMESHEET_HEADERS:
+        sheets_quota.execute_with_retry(
+            sheets.spreadsheets()
+            .values()
+            .update(
+                spreadsheetId=spreadsheet_id,
+                range=f"{TIMESHEET_TAB}!A5:L5",
+                valueInputOption="RAW",
+                body={"values": [TIMESHEET_HEADERS]},
+            ),
+            label="timesheet_fix_headers",
+        )
 
 
 def _read_data_rows(sheets, spreadsheet_id: str) -> list[list]:
-    result = (
+    result = sheets_quota.execute_with_retry(
         sheets.spreadsheets()
         .values()
         .get(
             spreadsheetId=spreadsheet_id,
-            range=f"{TIMESHEET_TAB}!A{DATA_START_ROW}:L",
+            range=f"{TIMESHEET_TAB}!A{DATA_START_ROW}:{LAST_DATA_COLUMN}",
             valueRenderOption="UNFORMATTED_VALUE",
-        )
-        .execute()
+        ),
+        label="timesheet_read_rows",
     )
     return result.get("values") or []
 
@@ -462,10 +572,14 @@ def _find_row_index(
     rows: list[list],
     project: str,
     task: str,
-    category: str,
+    category: str = "",
 ) -> int | None:
     """Return 0-based index into rows for matching Project/Task/Category."""
-    target = (_norm(project).lower(), _norm(task).lower(), _norm(category).lower())
+    target = (
+        _norm(project).lower(),
+        _norm(task).lower(),
+        _norm(category).lower(),
+    )
     for idx, row in enumerate(rows):
         padded = list(row) + [""] * (4 - len(row))
         key = (
@@ -496,7 +610,7 @@ def _activity_append(
     hours: float,
 ) -> str:
     """
-    Build Activity text for a Project/Task/Category row.
+    Build Activity text for a Project/Task row.
 
     Same weekday as the previous line (same task row): update that line — bump
     hours and append new accomplishment text with a comma (no repeated day).
@@ -593,7 +707,7 @@ def _refresh_totals_row(sheets, spreadsheet_id: str) -> None:
             stale_border_rows.add(row_num)
             sheets.spreadsheets().values().clear(
                 spreadsheetId=spreadsheet_id,
-                range=f"{TIMESHEET_TAB}!A{row_num}:L{row_num}",
+                range=f"{TIMESHEET_TAB}!A{row_num}:{LAST_DATA_COLUMN}{row_num}",
             ).execute()
 
     # Blank padding rows between last project and Total (and slightly past, in case
@@ -602,11 +716,12 @@ def _refresh_totals_row(sheets, spreadsheet_id: str) -> None:
         stale_border_rows.add(blank_row)
         sheets.spreadsheets().values().clear(
             spreadsheetId=spreadsheet_id,
-            range=f"{TIMESHEET_TAB}!A{blank_row}:L{blank_row}",
+            range=f"{TIMESHEET_TAB}!A{blank_row}:{LAST_DATA_COLUMN}{blank_row}",
         ).execute()
 
     start = DATA_START_ROW
     end = last_project
+    # A Total | B | C Category | D Activity | E..K days | L row-total
     values = [[
         "Total",
         "",
@@ -623,7 +738,7 @@ def _refresh_totals_row(sheets, spreadsheet_id: str) -> None:
     ]]
     sheets.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id,
-        range=f"{TIMESHEET_TAB}!A{total_row}:L{total_row}",
+        range=f"{TIMESHEET_TAB}!A{total_row}:{LAST_DATA_COLUMN}{total_row}",
         valueInputOption="USER_ENTERED",
         body={"values": values},
     ).execute()
@@ -648,7 +763,7 @@ def _refresh_totals_row(sheets, spreadsheet_id: str) -> None:
                     "startRowIndex": HEADER_ROW - 1,
                     "endRowIndex": total_row + 5,
                     "startColumnIndex": 0,
-                    "endColumnIndex": 12,
+                    "endColumnIndex": NUM_COLUMNS,
                 },
                 "cell": {},
                 "fields": "userEnteredFormat.borders",
@@ -665,51 +780,39 @@ def _refresh_totals_row(sheets, spreadsheet_id: str) -> None:
                     "startRowIndex": total_row - 1,
                     "endRowIndex": total_row,
                     "startColumnIndex": 0,
-                    "endColumnIndex": 12,
+                    "endColumnIndex": NUM_COLUMNS,
                 },
                 "cell": {
                     "userEnteredFormat": {
                         "borders": {
                             "top": {
-                                "style": "SOLID_MEDIUM",
+                                "style": "SOLID",
                                 "width": 2,
                                 "color": {"red": 0, "green": 0, "blue": 0},
                             }
                         },
+                        "textFormat": {"bold": True},
                     }
                 },
-                "fields": "userEnteredFormat.borders.top",
+                "fields": (
+                    "userEnteredFormat.borders.top,"
+                    "userEnteredFormat.textFormat.bold"
+                ),
             }
         }
     )
-    # Bold only the "Total" label in column A; keep E–L numeric cells not bold.
-    requests.extend(
-        [
+
+    # Clear bold/borders on stale Total positions.
+    for stale_row in stale_border_rows:
+        requests.append(
             {
                 "repeatCell": {
                     "range": {
                         "sheetId": sheet_id,
-                        "startRowIndex": total_row - 1,
-                        "endRowIndex": total_row,
+                        "startRowIndex": stale_row - 1,
+                        "endRowIndex": stale_row,
                         "startColumnIndex": 0,
-                        "endColumnIndex": 1,
-                    },
-                    "cell": {
-                        "userEnteredFormat": {
-                            "textFormat": {"bold": True},
-                        }
-                    },
-                    "fields": "userEnteredFormat.textFormat.bold",
-                }
-            },
-            {
-                "repeatCell": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "startRowIndex": total_row - 1,
-                        "endRowIndex": total_row,
-                        "startColumnIndex": 4,
-                        "endColumnIndex": 12,
+                        "endColumnIndex": NUM_COLUMNS,
                     },
                     "cell": {
                         "userEnteredFormat": {
@@ -718,9 +821,8 @@ def _refresh_totals_row(sheets, spreadsheet_id: str) -> None:
                     },
                     "fields": "userEnteredFormat.textFormat.bold",
                 }
-            },
-        ]
-    )
+            }
+        )
 
     sheets.spreadsheets().batchUpdate(
         spreadsheetId=spreadsheet_id,
@@ -732,22 +834,33 @@ def upsert_timesheet_entry(
     spreadsheet_id: str,
     project_name: str,
     task_label: str,
-    category_label: str,
     activity: str,
     hours: float,
     when: datetime,
+    category_label: str = "",
     sheets=None,
-) -> bool:
+    *,
+    rows: list[list] | None = None,
+) -> list[list]:
     """
     Add hours to the Project+Task+Category row for the entry's weekday,
-    and append the accomplishment into Activity.
+    and append the accomplishment into the Activity column (always column D).
+    Category may be blank; Activity is never written into the Category column.
+
+    Returns the in-memory data rows (refreshed after write) so callers can
+    reuse them across multiple entries without re-reading the sheet.
     """
     sheets = sheets or get_sheets_service()
-    rows = _read_data_rows(sheets, spreadsheet_id)
+    category_label = str(category_label or "").strip()
+    activity = str(activity or "").strip()
+    if rows is None:
+        rows = _read_data_rows(sheets, spreadsheet_id)
     project_indices = _iter_project_row_indices(rows)
     # Only search project rows for matches (ignore Total / gap).
     search_rows = [rows[i] for i in project_indices]
-    idx_in_search = _find_row_index(search_rows, project_name, task_label, category_label)
+    idx_in_search = _find_row_index(
+        search_rows, project_name, task_label, category_label
+    )
     day_col = _weekday_column(when)
 
     if idx_in_search is None:
@@ -762,8 +875,8 @@ def upsert_timesheet_entry(
         values = [[
             project_name,
             task_label,
-            category_label,
-            activity_text,
+            category_label,  # C — blank when no category
+            activity_text,   # D — always the accomplishment
             day_values["E"] or "",
             day_values["F"] or "",
             day_values["G"] or "",
@@ -773,25 +886,47 @@ def upsert_timesheet_entry(
             day_values["K"] or "",
             f"=IFERROR(SUM(E{new_row_num}:K{new_row_num}),0)",
         ]]
-        sheets.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range=f"{TIMESHEET_TAB}!A{new_row_num}:L{new_row_num}",
-            valueInputOption="USER_ENTERED",
-            body={"values": values},
-        ).execute()
-        # Activity newlines: rewrite Activity with RAW
-        sheets.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range=f"{TIMESHEET_TAB}!D{new_row_num}",
-            valueInputOption="RAW",
-            body={"values": [[activity_text]]},
-        ).execute()
-        return True
+        sheets_quota.execute_with_retry(
+            sheets.spreadsheets()
+            .values()
+            .update(
+                spreadsheetId=spreadsheet_id,
+                range=f"{TIMESHEET_TAB}!A{new_row_num}:{LAST_DATA_COLUMN}{new_row_num}",
+                valueInputOption="USER_ENTERED",
+                body={"values": values},
+            ),
+            label="timesheet_insert_row",
+        )
+        # Activity newlines: rewrite Activity (D) with RAW
+        sheets_quota.execute_with_retry(
+            sheets.spreadsheets()
+            .values()
+            .update(
+                spreadsheetId=spreadsheet_id,
+                range=f"{TIMESHEET_TAB}!D{new_row_num}",
+                valueInputOption="RAW",
+                body={"values": [[activity_text]]},
+            ),
+            label="timesheet_write_activity",
+        )
+        # Keep local cache in sync for subsequent entries in this request.
+        insert_at = len(project_indices)
+        rows = list(rows)
+        rows.insert(insert_at, list(values[0]))
+        return rows
 
     idx = project_indices[idx_in_search]
     row_num = _row_number_for_index(idx)
-    row = list(rows[idx]) + [""] * (12 - len(rows[idx]))
-    day_index = {"E": 4, "F": 5, "G": 6, "H": 7, "I": 8, "J": 9, "K": 10}[day_col]
+    row = list(rows[idx]) + [""] * (NUM_COLUMNS - len(rows[idx]))
+    day_index = {
+        "E": 4,
+        "F": 5,
+        "G": 6,
+        "H": 7,
+        "I": 8,
+        "J": 9,
+        "K": 10,
+    }[day_col]
     try:
         current = float(row[day_index] or 0)
     except (TypeError, ValueError):
@@ -799,25 +934,44 @@ def upsert_timesheet_entry(
     new_hours = round(current + float(hours), 2)
     new_activity = _activity_append(str(row[3] or ""), when, activity, hours)
 
-    sheets.spreadsheets().values().update(
-        spreadsheetId=spreadsheet_id,
-        range=f"{TIMESHEET_TAB}!D{row_num}",
-        valueInputOption="RAW",
-        body={"values": [[new_activity]]},
-    ).execute()
-    sheets.spreadsheets().values().update(
-        spreadsheetId=spreadsheet_id,
-        range=f"{TIMESHEET_TAB}!{day_col}{row_num}",
-        valueInputOption="USER_ENTERED",
-        body={"values": [[new_hours]]},
-    ).execute()
-    sheets.spreadsheets().values().update(
-        spreadsheetId=spreadsheet_id,
-        range=f"{TIMESHEET_TAB}!{TOTAL_COLUMN}{row_num}",
-        valueInputOption="USER_ENTERED",
-        body={"values": [[f"=IFERROR(SUM(E{row_num}:K{row_num}),0)"]]},
-    ).execute()
-    return True
+    sheets_quota.execute_with_retry(
+        sheets.spreadsheets()
+        .values()
+        .update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{TIMESHEET_TAB}!D{row_num}",
+            valueInputOption="RAW",
+            body={"values": [[new_activity]]},
+        ),
+        label="timesheet_update_activity",
+    )
+    sheets_quota.execute_with_retry(
+        sheets.spreadsheets()
+        .values()
+        .update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{TIMESHEET_TAB}!{day_col}{row_num}",
+            valueInputOption="USER_ENTERED",
+            body={"values": [[new_hours]]},
+        ),
+        label="timesheet_update_hours",
+    )
+    sheets_quota.execute_with_retry(
+        sheets.spreadsheets()
+        .values()
+        .update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{TIMESHEET_TAB}!{TOTAL_COLUMN}{row_num}",
+            valueInputOption="USER_ENTERED",
+            body={"values": [[f"=IFERROR(SUM(E{row_num}:K{row_num}),0)"]]},
+        ),
+        label="timesheet_update_total",
+    )
+    row[3] = new_activity
+    row[day_index] = new_hours
+    rows = list(rows)
+    rows[idx] = row
+    return rows
 
 
 def process_timesheet_update(
@@ -853,23 +1007,26 @@ def process_timesheet_update(
         )
 
         touched = 0
+        cached_rows: list[list] | None = None
         for entry in entries:
             project_name = project_router.get_project_display_name(entry.project_key)
-            upsert_timesheet_entry(
+            cached_rows = upsert_timesheet_entry(
                 assets.spreadsheet_id,
                 project_name=project_name,
                 task_label=entry.task_label or entry.task,
-                category_label=entry.category_label,
+                category_label=entry.category_label or "",
                 activity=entry.activity,
                 hours=entry.hours,
                 when=entry.timestamp,
                 sheets=sheets,
+                rows=cached_rows,
             )
             touched += 1
 
         if touched:
             _refresh_totals_row(sheets, assets.spreadsheet_id)
-            _autosize_timesheet_columns(sheets, assets.spreadsheet_id)
+            # Skip autosize on the hot Slack path — it costs extra read quota
+            # (60 reads/min/user) and isn't required for correct logging.
 
         print(
             f"  [TIMESHEET SUCCESS] Wrote {touched} entr(y/ies) to "

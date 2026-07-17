@@ -579,28 +579,66 @@ def _upload_temp_public_png(
     filename: str,
     folder_id: str = "",
 ) -> tuple[str, str]:
-    """Upload PNG to Drive with anyone-with-link read; return (file_id, public_uri)."""
+    """
+    Upload PNG to Drive with anyone-with-link read; return (file_id, public_uri).
+
+    If a file with the same name already exists in the folder, replace its
+    contents in place instead of creating a duplicate.
+    """
     drive = _get_drive_service()
     media = MediaIoBaseUpload(io.BytesIO(png_bytes), mimetype="image/png", resumable=False)
-    body: dict = {"name": filename, "mimeType": "image/png"}
+    file_id = ""
+
     if folder_id:
-        body["parents"] = [folder_id]
-    created = (
-        drive.files()
-        .create(
-            body=body,
-            media_body=media,
-            fields="id",
-            supportsAllDrives=True,
+        # Prefer oldest match; trash any other same-name copies.
+        matches = project_router._list_files_in_folder(
+            folder_id, filename, "image/png", drive=drive
         )
-        .execute()
-    )
-    file_id = created["id"]
-    drive.permissions().create(
-        fileId=file_id,
-        body={"type": "anyone", "role": "reader"},
-        supportsAllDrives=True,
-    ).execute()
+        if matches:
+            file_id = matches[0]["id"]
+            for extra in matches[1:]:
+                print(
+                    f"  [JOURNAL] Trashing duplicate chart PNG {extra['id']} "
+                    f"(keeping {file_id})",
+                    flush=True,
+                )
+                _trash_drive_file(extra["id"])
+
+    if file_id:
+        drive.files().update(
+            fileId=file_id,
+            media_body=media,
+            supportsAllDrives=True,
+            fields="id",
+        ).execute()
+        print(f"  [JOURNAL] Replaced existing chart PNG '{filename}' ({file_id})", flush=True)
+    else:
+        body: dict = {"name": filename, "mimeType": "image/png"}
+        if folder_id:
+            body["parents"] = [folder_id]
+        created = (
+            drive.files()
+            .create(
+                body=body,
+                media_body=media,
+                fields="id",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+        file_id = created["id"]
+        print(f"  [JOURNAL] Uploaded chart PNG '{filename}' ({file_id})", flush=True)
+
+    try:
+        drive.permissions().create(
+            fileId=file_id,
+            body={"type": "anyone", "role": "reader"},
+            supportsAllDrives=True,
+        ).execute()
+    except Exception as exc:
+        # Permission may already exist from a prior upload.
+        print(f"  [JOURNAL] Chart PNG share note: {exc}", flush=True)
+
     uri = f"https://drive.google.com/uc?export=download&id={file_id}"
     return file_id, uri
 
@@ -727,9 +765,8 @@ def sync_category_chart_into_doc(
         _ensure_chart_markers(document_id, service=service)
 
     sheets = agent_sheets.get_sheets_service()
-    agent_sheets.ensure_category_estimate_table(
-        sheets, spreadsheet_id, project_key=project_key
-    )
+    # Dashboard was already rebuilt when ActivityLog was appended — do not
+    # refresh again (Sheets read quota is 60/min/user).
 
     # Sheet rows only for chart fallback if Firestore has no tasks yet.
     sheet_task_rows = agent_sheets.get_dashboard_task_rows(
@@ -1084,8 +1121,9 @@ def _update_summary_from_sheet(
     project_key: str = "",
 ) -> bool:
     week_start, week_end, week_label = jm.get_current_week_range()
+    # Week cells only — ActivityLog append already refreshed Dashboard tables.
     agent_sheets.update_dashboard_week(
-        spreadsheet_id, week_start, week_label, project_key=project_key
+        spreadsheet_id, week_start, week_label, project_key=project_key, refresh=False
     )
 
     week_entries = agent_sheets.read_week_entries(
@@ -1149,6 +1187,13 @@ def refresh_weekly_summary(
 
         spreadsheet_id = agent_sheets.ensure_spreadsheet(
             project_name, spreadsheet_id, project_key=project_key
+        )
+        # One Dashboard rebuild for /refreshjournal (ensure_spreadsheet no longer does this).
+        agent_sheets.refresh_dashboard_tables(
+            agent_sheets.get_sheets_service(),
+            spreadsheet_id,
+            project_key=project_key,
+            autosize=False,
         )
         summary_updated = _update_summary_from_sheet(
             document_id, spreadsheet_id, project_name, service, project_key=project_key

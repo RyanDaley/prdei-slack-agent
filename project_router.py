@@ -3,10 +3,12 @@ AEC Project Router Utility.
 
 Each project points at a Google Drive folder. Inside that folder the agent
 ensures:
-  - a Google Sheet named "Detailed Activity Log"
+  - a Google Sheet named "Detailed Activity Log" (reused; never intentionally
+    duplicated — file ID is also stored on the Firestore project)
   - a Google Doc for the current 2-week period, titled with this Saturday's
     date (YYYY-MM-DD). Existing docs titled with this Saturday OR next
-    Saturday are reused.
+    Saturday are reused. A new Doc is only created when the biweekly period
+    rolls to a new Saturday title.
 """
 
 from __future__ import annotations
@@ -275,12 +277,13 @@ def _escape_drive_query(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'")
 
 
-def _find_file_in_folder(
+def _list_files_in_folder(
     folder_id: str,
     name: str,
     mime_type: str,
     drive=None,
-) -> Optional[str]:
+) -> list[dict]:
+    """Return all non-trashed matches (oldest first)."""
     drive = drive or get_drive_service()
     query = (
         f"'{folder_id}' in parents "
@@ -293,15 +296,61 @@ def _find_file_in_folder(
         .list(
             q=query,
             spaces="drive",
-            fields="files(id, name)",
-            pageSize=5,
+            fields="files(id, name, createdTime)",
+            pageSize=25,
+            orderBy="createdTime",
+            corpora="allDrives",
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,
         )
         .execute()
     )
-    files = response.get("files") or []
-    return files[0]["id"] if files else None
+    return list(response.get("files") or [])
+
+
+def _find_file_in_folder(
+    folder_id: str,
+    name: str,
+    mime_type: str,
+    drive=None,
+) -> Optional[str]:
+    """
+    Return the file ID for name+mime in folder.
+    If duplicates exist, reuse the oldest and log a warning (do not create another).
+    """
+    files = _list_files_in_folder(folder_id, name, mime_type, drive=drive)
+    if not files:
+        return None
+    if len(files) > 1:
+        ids = ", ".join(f"{f['id']}" for f in files)
+        print(
+            f"  [ROUTER WARNING] Found {len(files)} files named '{name}' in folder "
+            f"{folder_id}. Reusing oldest ({files[0]['id']}); delete extras: {ids}",
+            flush=True,
+        )
+    return files[0]["id"]
+
+
+def _file_still_usable(file_id: str, drive=None) -> bool:
+    """True if file_id exists and is not trashed."""
+    file_id = (file_id or "").strip()
+    if not file_id:
+        return False
+    drive = drive or get_drive_service()
+    try:
+        meta = (
+            drive.files()
+            .get(
+                fileId=file_id,
+                fields="id, trashed",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+        return bool(meta.get("id")) and not bool(meta.get("trashed"))
+    except Exception as exc:
+        print(f"  [ROUTER] Stored file {file_id} not usable: {exc}", flush=True)
+        return False
 
 
 def _find_period_document(folder_id: str, drive=None) -> tuple[Optional[str], str]:
@@ -321,6 +370,11 @@ def _find_period_document(folder_id: str, drive=None) -> tuple[Optional[str], st
 
 def _create_document_in_folder(folder_id: str, title: str, drive=None) -> str:
     drive = drive or get_drive_service()
+    # Re-check immediately before create to reduce duplicate races.
+    existing = _find_file_in_folder(folder_id, title, DOC_MIME, drive=drive)
+    if existing:
+        print(f"  [ROUTER] Reusing period Doc '{title}' ({existing}) before create")
+        return existing
     created = (
         drive.files()
         .create(
@@ -334,12 +388,25 @@ def _create_document_in_folder(folder_id: str, title: str, drive=None) -> str:
         )
         .execute()
     )
+    # If a race created another copy, always prefer the oldest.
+    oldest = _find_file_in_folder(folder_id, title, DOC_MIME, drive=drive)
+    if oldest and oldest != created["id"]:
+        print(
+            f"  [ROUTER WARNING] Duplicate Doc '{title}' created during race; "
+            f"using oldest {oldest} (new {created['id']})",
+            flush=True,
+        )
+        return oldest
     print(f"  [ROUTER] Created period Doc '{title}' ({created['id']}) in folder {folder_id}")
     return created["id"]
 
 
 def _create_spreadsheet_in_folder(folder_id: str, title: str, drive=None) -> str:
     drive = drive or get_drive_service()
+    existing = _find_file_in_folder(folder_id, title, SHEET_MIME, drive=drive)
+    if existing:
+        print(f"  [ROUTER] Reusing spreadsheet '{title}' ({existing}) before create")
+        return existing
     created = (
         drive.files()
         .create(
@@ -353,14 +420,33 @@ def _create_spreadsheet_in_folder(folder_id: str, title: str, drive=None) -> str
         )
         .execute()
     )
+    oldest = _find_file_in_folder(folder_id, title, SHEET_MIME, drive=drive)
+    if oldest and oldest != created["id"]:
+        print(
+            f"  [ROUTER WARNING] Duplicate Sheet '{title}' created during race; "
+            f"using oldest {oldest} (new {created['id']})",
+            flush=True,
+        )
+        return oldest
     print(
         f"  [ROUTER] Created spreadsheet '{title}' ({created['id']}) in folder {folder_id}"
     )
     return created["id"]
 
 
-def ensure_detailed_activity_log_sheet(folder_id: str, drive=None) -> str:
+def ensure_detailed_activity_log_sheet(
+    folder_id: str,
+    drive=None,
+    *,
+    preferred_id: str = "",
+) -> str:
     drive = drive or get_drive_service()
+    if preferred_id and _file_still_usable(preferred_id, drive=drive):
+        print(
+            f"  [ROUTER] Reusing stored Detailed Activity Log ({preferred_id})",
+            flush=True,
+        )
+        return preferred_id
     existing = _find_file_in_folder(
         folder_id, DETAILED_ACTIVITY_LOG_SHEET_NAME, SHEET_MIME, drive=drive
     )
@@ -371,8 +457,29 @@ def ensure_detailed_activity_log_sheet(folder_id: str, drive=None) -> str:
     )
 
 
-def ensure_period_document(folder_id: str, drive=None) -> tuple[str, str]:
+def ensure_period_document(
+    folder_id: str,
+    drive=None,
+    *,
+    preferred_id: str = "",
+    preferred_title: str = "",
+) -> tuple[str, str]:
     drive = drive or get_drive_service()
+    this_title, next_title = period_doc_titles()
+    valid_titles = {this_title, next_title}
+
+    # Reuse Firestore-tracked period Doc when it still matches this biweekly window.
+    if (
+        preferred_id
+        and preferred_title in valid_titles
+        and _file_still_usable(preferred_id, drive=drive)
+    ):
+        print(
+            f"  [ROUTER] Reusing stored period Doc '{preferred_title}' ({preferred_id})",
+            flush=True,
+        )
+        return preferred_id, preferred_title
+
     existing_id, create_title = _find_period_document(folder_id, drive=drive)
     if existing_id:
         return existing_id, create_title
@@ -382,15 +489,38 @@ def ensure_period_document(folder_id: str, drive=None) -> tuple[str, str]:
 def ensure_project_assets(project_value: str) -> Optional[ProjectAssets]:
     """
     Resolve folder + ensure Sheet/Doc exist for this project and biweekly period.
+    Reuses Firestore-stored file IDs and oldest same-name Drive matches so we
+    do not keep creating duplicate Detailed Activity Log / period Docs.
     """
     folder_id = get_folder_id_for_project(project_value)
     if not folder_id:
         return None
 
+    preferred_sheet = ""
+    preferred_doc = ""
+    preferred_doc_title = ""
+    try:
+        import firestore_store
+
+        record = firestore_store.get_project(project_value)
+        if record:
+            preferred_sheet = record.activity_log_spreadsheet_id or ""
+            preferred_doc = record.period_document_id or ""
+            preferred_doc_title = record.period_document_title or ""
+    except Exception as exc:
+        print(f"[ROUTER] Could not load stored Drive asset IDs: {exc}", flush=True)
+
     try:
         drive = get_drive_service()
-        spreadsheet_id = ensure_detailed_activity_log_sheet(folder_id, drive=drive)
-        document_id, document_title = ensure_period_document(folder_id, drive=drive)
+        spreadsheet_id = ensure_detailed_activity_log_sheet(
+            folder_id, drive=drive, preferred_id=preferred_sheet
+        )
+        document_id, document_title = ensure_period_document(
+            folder_id,
+            drive=drive,
+            preferred_id=preferred_doc,
+            preferred_title=preferred_doc_title,
+        )
     except Exception as exc:
         print(
             f"[ROUTER ERROR] Failed ensuring Drive assets for '{project_value}' "
@@ -398,6 +528,23 @@ def ensure_project_assets(project_value: str) -> Optional[ProjectAssets]:
             flush=True,
         )
         raise
+
+    try:
+        import firestore_store
+
+        if (
+            spreadsheet_id != preferred_sheet
+            or document_id != preferred_doc
+            or document_title != preferred_doc_title
+        ):
+            firestore_store.set_project_drive_assets(
+                project_value,
+                activity_log_spreadsheet_id=spreadsheet_id,
+                period_document_id=document_id,
+                period_document_title=document_title,
+            )
+    except Exception as exc:
+        print(f"[ROUTER WARNING] Could not persist Drive asset IDs: {exc}", flush=True)
 
     return ProjectAssets(
         project_key=project_value,

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import threading
 from collections import defaultdict
 from datetime import datetime
@@ -44,11 +45,23 @@ TASK_OPTION_EMPTY = {
 }
 PLACEHOLDER_TASK_VALUES = {TASK_OPTION_NEED_PROJECT["value"], TASK_OPTION_EMPTY["value"]}
 
-FALLBACK_CATEGORY_OPTIONS = [
-    {"text": {"type": "plain_text", "text": "CAD / BIM Modeling"}, "value": "cad_modeling"},
-    {"text": {"type": "plain_text", "text": "Permitting / Code Review"}, "value": "permitting"},
-    {"text": {"type": "plain_text", "text": "Engineering / Calcs"}, "value": "engineering"},
-]
+CATEGORY_OPTION_NEED_TASK = {
+    "text": {"type": "plain_text", "text": "Select a task first"},
+    "value": "_need_task",
+}
+CATEGORY_OPTION_EMPTY = {
+    "text": {"type": "plain_text", "text": "No categories yet — use +"},
+    "value": "_no_categories",
+}
+CATEGORY_OPTION_NONE = {
+    "text": {"type": "plain_text", "text": "(no category)"},
+    "value": "_none",
+}
+PLACEHOLDER_CATEGORY_VALUES = {
+    CATEGORY_OPTION_NEED_TASK["value"],
+    CATEGORY_OPTION_EMPTY["value"],
+    CATEGORY_OPTION_NONE["value"],
+}
 
 ENTRY_DURATION_OPTIONS = [
     {"text": {"type": "plain_text", "text": "0.25 hr"}, "value": "0.25"},
@@ -61,8 +74,8 @@ ENTRY_DURATION_OPTIONS = [
 ]
 ENTRY_DURATION_VALUES = {opt["value"] for opt in ENTRY_DURATION_OPTIONS}
 DEFAULT_ENTRY_DURATION = "1.0"
-MIN_ENTRY_ROWS = 2
-MAX_ENTRY_ROWS = 6
+MIN_ENTRY_ROWS = 1
+MAX_ENTRY_ROWS = 12
 
 
 def _option(text: str, value: str) -> dict:
@@ -96,14 +109,21 @@ def _task_options(project_id: str | None = None) -> list[dict]:
         return [TASK_OPTION_EMPTY]
 
 
-def _category_options() -> list[dict]:
+def _category_options(task_id: str | None = None) -> list[dict]:
+    """Categories for one task. Optional — always allow '(no category)' once a task is set."""
+    if not task_id or task_id in PLACEHOLDER_TASK_VALUES:
+        return [CATEGORY_OPTION_NEED_TASK]
     try:
-        categories = firestore_store.list_categories()
+        categories = firestore_store.list_categories(task_id)
         if categories:
-            return [_option(c.name, c.id) for c in categories]
+            return [CATEGORY_OPTION_NONE, *[_option(c.name, c.id) for c in categories]]
+        return [CATEGORY_OPTION_NONE, CATEGORY_OPTION_EMPTY]
     except Exception as exc:
-        print(f"[SLACK] Firestore category options failed; using fallback: {exc}", flush=True)
-    return list(FALLBACK_CATEGORY_OPTIONS)
+        print(
+            f"[SLACK] Firestore category options failed; using empty placeholder: {exc}",
+            flush=True,
+        )
+        return [CATEGORY_OPTION_NONE, CATEGORY_OPTION_EMPTY]
 
 
 def _create_plus_button(action_id: str, value: str, accessibility_label: str) -> dict:
@@ -119,15 +139,13 @@ def _create_plus_button(action_id: str, value: str, accessibility_label: str) ->
 
 def _open_logtime_modal(client, trigger_id: str, channel_id: str, user_id: str):
     preserve_state = None
-    row_count = MIN_ENTRY_ROWS
+    row_count = MIN_ENTRY_ROWS  # Always open with a single entry slot.
     try:
         last = firestore_store.get_last_logtime(user_id)
         if last and last.entries:
             preserve_state = _preserve_state_from_last_logtime(last)
-            row_count = _row_count_for_state(preserve_state)
             print(
-                f"[SLACK] Prefilling logtime for {user_id} "
-                f"from last entry ({len(last.entries)} row(s), {row_count} slots).",
+                f"[SLACK] Prefilling logtime for {user_id} from last Entry 1.",
                 flush=True,
             )
     except Exception as exc:
@@ -142,46 +160,61 @@ def _open_logtime_modal(client, trigger_id: str, channel_id: str, user_id: str):
 
 def _preserve_state_from_last_logtime(last: firestore_store.LastLogtime) -> dict:
     """
-    Build Slack-shaped preserve_state so build_logtime_modal can set
-    initial_option / initial_value from the previous submission.
+    Prefill Entry 1 only from the previous submission.
+    Extra entries from prior submits are intentionally ignored.
     """
     state: dict = {}
-    for row_index, entry in enumerate(last.entries[:MAX_ENTRY_ROWS]):
-        (
-            project_block_id,
-            task_block_id,
-            category_block_id,
-            accomplishment_block_id,
-        ) = _entry_block_ids(row_index)
-        duration_block_id = _duration_block_id(row_index)
-        hours = entry.hours if entry.hours in ENTRY_DURATION_VALUES else DEFAULT_ENTRY_DURATION
-        state[duration_block_id] = {
-            "entry_duration_select": {"selected_option": {"value": hours}}
+    if not last.entries:
+        return state
+    entry = last.entries[0]
+    row_index = 0
+    project_key = entry.project_key or ""
+    task_id = entry.task or ""
+    # Legacy global task keys → project-scoped document ids for prefill.
+    if (
+        project_key
+        and project_key != BREAK_PROJECT_VALUE
+        and task_id
+        and "__" not in task_id
+    ):
+        task_id = firestore_store.task_doc_id(project_key, task_id)
+
+    (
+        project_block_id,
+        task_block_id,
+        category_block_id,
+        accomplishment_block_id,
+    ) = _entry_block_ids(row_index, project_key=project_key, task_key=task_id)
+    duration_block_id = _duration_block_id(row_index)
+    hours = entry.hours if entry.hours in ENTRY_DURATION_VALUES else DEFAULT_ENTRY_DURATION
+    state[duration_block_id] = {
+        "entry_duration_select": {"selected_option": {"value": hours}}
+    }
+    if project_key:
+        state[project_block_id] = {
+            "project_select": {"selected_option": {"value": project_key}}
         }
-        if entry.project_key:
-            state[project_block_id] = {
-                "project_select": {"selected_option": {"value": entry.project_key}}
-            }
-        if entry.task:
-            task_id = entry.task
-            # Legacy global task keys → project-scoped document ids for prefill.
-            if (
-                entry.project_key
-                and entry.project_key != BREAK_PROJECT_VALUE
-                and "__" not in task_id
-            ):
-                task_id = firestore_store.task_doc_id(entry.project_key, task_id)
-            state[task_block_id] = {
-                "task_select": {"selected_option": {"value": task_id}}
-            }
-        if entry.category:
-            state[category_block_id] = {
-                "category_select": {"selected_option": {"value": entry.category}}
-            }
-        if entry.activity:
-            state[accomplishment_block_id] = {
-                "accomplishment_input": {"value": entry.activity}
-            }
+    if task_id:
+        state[task_block_id] = {
+            "task_select": {"selected_option": {"value": task_id}}
+        }
+    if entry.category:
+        category_id = entry.category
+        # Legacy global category keys → task-scoped document ids for prefill.
+        if (
+            task_id
+            and "__" not in category_id
+            and task_id not in PLACEHOLDER_TASK_VALUES
+        ):
+            category_id = firestore_store.category_doc_id(task_id, category_id)
+        category_block_id = _category_block_id(row_index, task_id)
+        state[category_block_id] = {
+            "category_select": {"selected_option": {"value": category_id}}
+        }
+    if entry.activity:
+        state[accomplishment_block_id] = {
+            "accomplishment_input": {"value": entry.activity}
+        }
     return state
 
 
@@ -199,8 +232,53 @@ def _state_value(state: dict | None, block_id: str, action_id: str, field: str =
     return None
 
 
+def _state_value_by_prefix(
+    state: dict | None, prefix: str, action_id: str, field: str = "value"
+):
+    """Read a value from block_id == prefix or block_id starting with prefix__."""
+    if not state:
+        return None
+    for block_id in state:
+        if block_id == prefix or block_id.startswith(prefix + "__"):
+            val = _state_value(state, block_id, action_id, field)
+            if val is not None:
+                return val
+    return None
+
+
+def _pop_blocks_with_prefix(state: dict, prefix: str) -> None:
+    for key in list(state.keys()):
+        if key == prefix or key.startswith(prefix + "__"):
+            state.pop(key, None)
+
+
+def _block_token(value: str | None) -> str:
+    """Stable, Slack-safe token so dependent block_ids change when parent changes."""
+    raw = (value or "none").strip() or "none"
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]", "_", raw)
+    return (cleaned[:80] or "none")
+
+
 def _duration_block_id(row_index: int) -> str:
     return f"entry_{row_index}_duration_block"
+
+
+def _project_block_id(row_index: int) -> str:
+    return f"entry_{row_index}_project_block"
+
+
+def _task_block_id(row_index: int, project_key: str | None = None) -> str:
+    # Include project so Slack treats Task as a new block when project changes
+    # (otherwise the dropdown options often do not refresh).
+    return f"entry_{row_index}_task_block__{_block_token(project_key)}"
+
+
+def _category_block_id(row_index: int, task_key: str | None = None) -> str:
+    return f"entry_{row_index}_category_block__{_block_token(task_key)}"
+
+
+def _accomplishment_block_id(row_index: int) -> str:
+    return f"entry_{row_index}_accomplishment_block"
 
 
 def _hours_to_option_value(hours: float) -> str:
@@ -213,35 +291,59 @@ def _hours_to_option_value(hours: float) -> str:
     return DEFAULT_ENTRY_DURATION
 
 
-def _entry_block_ids(row_index: int) -> tuple[str, str, str, str]:
+def _entry_block_ids(
+    row_index: int,
+    *,
+    project_key: str | None = None,
+    task_key: str | None = None,
+) -> tuple[str, str, str, str]:
     """Return (project_block_id, task_block_id, category_block_id, accomplishment_block_id)."""
     return (
-        f"entry_{row_index}_project_block",
-        f"entry_{row_index}_task_block",
-        f"entry_{row_index}_category_block",
-        f"entry_{row_index}_accomplishment_block",
+        _project_block_id(row_index),
+        _task_block_id(row_index, project_key),
+        _category_block_id(row_index, task_key),
+        _accomplishment_block_id(row_index),
     )
 
 
-def _entry_is_filled(state: dict | None, row_index: int) -> bool:
-    """True when a work entry (or Break) is complete enough to free another blank slot."""
-    (
-        project_block_id,
-        task_block_id,
-        category_block_id,
-        accomplishment_block_id,
-    ) = _entry_block_ids(row_index)
-    project_key = _state_value(state, project_block_id, "project_select", "selected_option")
-    if not project_key:
-        return False
-    if project_key == BREAK_PROJECT_VALUE:
-        return True
-    task_key = _state_value(state, task_block_id, "task_select", "selected_option")
-    category_key = _state_value(state, category_block_id, "category_select", "selected_option")
-    accomplishment = _state_value(state, accomplishment_block_id, "accomplishment_input")
-    if task_key in PLACEHOLDER_TASK_VALUES:
-        task_key = None
-    return bool(task_key and category_key and accomplishment and str(accomplishment).strip())
+def _read_row_project(state: dict | None, row_index: int) -> str | None:
+    return _state_value(
+        state, _project_block_id(row_index), "project_select", "selected_option"
+    )
+
+
+def _read_row_task(state: dict | None, row_index: int, project_key: str | None = None) -> str | None:
+    if project_key is None:
+        project_key = _read_row_project(state, row_index)
+    val = _state_value(
+        state,
+        _task_block_id(row_index, project_key),
+        "task_select",
+        "selected_option",
+    )
+    if val is not None:
+        return val
+    return _state_value_by_prefix(
+        state, f"entry_{row_index}_task_block", "task_select", "selected_option"
+    )
+
+
+def _read_row_category(
+    state: dict | None, row_index: int, task_key: str | None = None
+) -> str | None:
+    if task_key is None:
+        task_key = _read_row_task(state, row_index)
+    val = _state_value(
+        state,
+        _category_block_id(row_index, task_key),
+        "category_select",
+        "selected_option",
+    )
+    if val is not None:
+        return val
+    return _state_value_by_prefix(
+        state, f"entry_{row_index}_category_block", "category_select", "selected_option"
+    )
 
 
 def _row_count_from_view_state(state: dict | None) -> int:
@@ -249,44 +351,73 @@ def _row_count_from_view_state(state: dict | None) -> int:
     if not state:
         return MIN_ENTRY_ROWS
     count = 0
-    while (
-        _duration_block_id(count) in state
-        or f"entry_{count}_project_block" in state
-        or f"entry_{count}_accomplishment_block" in state
-    ):
-        count += 1
-        if count >= MAX_ENTRY_ROWS:
+    while count < MAX_ENTRY_ROWS:
+        if (
+            _duration_block_id(count) in state
+            or _project_block_id(count) in state
+            or _accomplishment_block_id(count) in state
+            or any(str(k).startswith(f"entry_{count}_") for k in state)
+        ):
+            count += 1
+        else:
             break
     return max(count, MIN_ENTRY_ROWS)
 
 
-def _row_count_for_state(state: dict | None, current_row_count: int | None = None) -> int:
-    """Always leave one blank slot after filled rows (min 2, max MAX_ENTRY_ROWS)."""
-    base = current_row_count or _row_count_from_view_state(state)
-    filled = sum(1 for i in range(base) if _entry_is_filled(state, i))
-    return min(MAX_ENTRY_ROWS, max(MIN_ENTRY_ROWS, filled + 1))
-
-
 def _sanitize_task_selections(state: dict | None) -> dict | None:
-    """Drop task selections that don't belong to the row's current project."""
+    """
+    Drop task/category selections that don't belong to the row's project/task,
+    and rewrite them under the project/task-scoped block_ids so rebuilds refresh
+    the cascading dropdowns in Slack.
+    """
     if not state:
         return state
     for row_index in range(MAX_ENTRY_ROWS):
-        project_block_id, task_block_id, _, _ = _entry_block_ids(row_index)
-        if project_block_id not in state and task_block_id not in state:
+        project_key = _read_row_project(state, row_index)
+        task_prefix = f"entry_{row_index}_task_block"
+        cat_prefix = f"entry_{row_index}_category_block"
+        has_row = (
+            _project_block_id(row_index) in state
+            or any(
+                k == task_prefix or k.startswith(task_prefix + "__") or
+                k == cat_prefix or k.startswith(cat_prefix + "__")
+                for k in state
+            )
+        )
+        if not has_row and _duration_block_id(row_index) not in state:
             continue
-        project_key = _state_value(state, project_block_id, "project_select", "selected_option")
-        task_key = _state_value(state, task_block_id, "task_select", "selected_option")
-        if not task_key:
-            continue
-        valid_ids = {opt["value"] for opt in _task_options(project_key)}
-        if task_key not in valid_ids or task_key in PLACEHOLDER_TASK_VALUES:
-            block = dict(state.get(task_block_id) or {})
-            block.pop("task_select", None)
-            if block:
-                state[task_block_id] = block
-            else:
-                state.pop(task_block_id, None)
+
+        task_key = _state_value_by_prefix(
+            state, task_prefix, "task_select", "selected_option"
+        )
+        category_key = _state_value_by_prefix(
+            state, cat_prefix, "category_select", "selected_option"
+        )
+
+        _pop_blocks_with_prefix(state, task_prefix)
+        _pop_blocks_with_prefix(state, cat_prefix)
+
+        if task_key in PLACEHOLDER_TASK_VALUES:
+            task_key = None
+        if task_key:
+            valid_ids = {opt["value"] for opt in _task_options(project_key)}
+            if task_key not in valid_ids:
+                task_key = None
+        if task_key:
+            state[_task_block_id(row_index, project_key)] = {
+                "task_select": {"selected_option": {"value": task_key}}
+            }
+
+        if category_key in PLACEHOLDER_CATEGORY_VALUES:
+            category_key = None
+        if category_key and task_key:
+            valid_cats = {opt["value"] for opt in _category_options(task_key)}
+            if category_key not in valid_cats:
+                category_key = None
+        if category_key and task_key:
+            state[_category_block_id(row_index, task_key)] = {
+                "category_select": {"selected_option": {"value": category_key}}
+            }
     return state
 
 
@@ -294,19 +425,26 @@ def _entry_row_blocks(
     row_index: int,
     preserve_state: dict | None = None,
 ) -> list[dict]:
+    saved_project = _read_row_project(preserve_state, row_index)
+    saved_task = _read_row_task(preserve_state, row_index, saved_project)
+    if saved_task in PLACEHOLDER_TASK_VALUES:
+        saved_task = None
+    saved_category = _read_row_category(preserve_state, row_index, saved_task)
+    if saved_category in PLACEHOLDER_CATEGORY_VALUES:
+        saved_category = None
+
     (
         project_block_id,
         task_block_id,
         category_block_id,
         accomplishment_block_id,
-    ) = _entry_block_ids(row_index)
+    ) = _entry_block_ids(
+        row_index, project_key=saved_project, task_key=saved_task
+    )
     duration_block_id = _duration_block_id(row_index)
     project_options = _project_options(allow_break=True)
-    saved_project = _state_value(
-        preserve_state, project_block_id, "project_select", "selected_option"
-    )
     task_options = _task_options(saved_project)
-    category_options = _category_options()
+    category_options = _category_options(saved_task)
 
     saved_duration = (
         _state_value(preserve_state, duration_block_id, "entry_duration_select", "selected_option")
@@ -346,18 +484,9 @@ def _entry_row_blocks(
         "type": "plain_text_input",
         "action_id": "accomplishment_input",
         "multiline": True,
-        "dispatch_action_config": {
-            "trigger_actions_on": ["on_character_entered"],
-        },
         "placeholder": {"type": "plain_text", "text": "What did you accomplish?"},
     }
 
-    saved_task = _state_value(
-        preserve_state, task_block_id, "task_select", "selected_option"
-    )
-    saved_category = _state_value(
-        preserve_state, category_block_id, "category_select", "selected_option"
-    )
     saved_accomplishment = _state_value(
         preserve_state, accomplishment_block_id, "accomplishment_input"
     )
@@ -366,7 +495,7 @@ def _entry_row_blocks(
         matched = next((opt for opt in project_options if opt["value"] == saved_project), None)
         if matched:
             project_element["initial_option"] = matched
-    if saved_task and saved_task not in PLACEHOLDER_TASK_VALUES:
+    if saved_task:
         matched_task = next((opt for opt in task_options if opt["value"] == saved_task), None)
         if matched_task:
             task_element["initial_option"] = matched_task
@@ -423,14 +552,13 @@ def _entry_row_blocks(
                 _create_plus_button(
                     "create_category_btn",
                     str(row_index),
-                    "Create a new category",
+                    "Create a new category for this task",
                 ),
             ],
         },
         {
             "type": "input",
             "block_id": accomplishment_block_id,
-            "dispatch_action": True,
             "element": accomplishment_element,
             "label": {"type": "plain_text", "text": "What did you accomplish?"},
             "optional": True,
@@ -447,25 +575,14 @@ def build_logtime_modal(
 
     blocks = [
         {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    "Log your activities. Each entry has its own duration "
-                    "(defaults to *1.0 hr*). Leave unused entries blank — "
-                    "they count as Break and are not written to the journal."
-                ),
-            },
-        },
-        {
             "type": "context",
             "elements": [
                 {
                     "type": "mrkdwn",
                     "text": (
                         "Use *+* next to Project / Task / Category to create a new one. "
-                        "Tasks belong to the selected project. "
-                        "A new blank entry appears when every visible entry is filled."
+                        "Changing Project refreshes Tasks; changing Task refreshes Categories. "
+                        "Category is optional."
                     ),
                 }
             ],
@@ -474,6 +591,34 @@ def build_logtime_modal(
 
     for row_index in range(row_count):
         blocks.extend(_entry_row_blocks(row_index, preserve_state))
+
+    if row_count < MAX_ENTRY_ROWS:
+        blocks.append(
+            {
+                "type": "actions",
+                "block_id": "add_entry_block",
+                "elements": [
+                    {
+                        "type": "button",
+                        "action_id": "add_entry_btn",
+                        "text": {"type": "plain_text", "text": "+ Entry"},
+                        "value": "add",
+                    }
+                ],
+            }
+        )
+    else:
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"Maximum of *{MAX_ENTRY_ROWS}* entries reached.",
+                    }
+                ],
+            }
+        )
 
     return {
         "type": "modal",
@@ -499,13 +644,8 @@ def _parse_modal_submission(state_values: dict, user_name: str) -> tuple[list[jm
     break_hours = 0.0
 
     for row_index in range(row_count):
-        (
-            project_block_id,
-            task_block_id,
-            category_block_id,
-            accomplishment_block_id,
-        ) = _entry_block_ids(row_index)
         duration_block_id = _duration_block_id(row_index)
+        accomplishment_block_id = _accomplishment_block_id(row_index)
 
         hours_raw = (
             _state_value(
@@ -518,13 +658,9 @@ def _parse_modal_submission(state_values: dict, user_name: str) -> tuple[list[jm
         except (TypeError, ValueError):
             hours = 1.0
 
-        project_key = _state_value(
-            state_values, project_block_id, "project_select", "selected_option"
-        )
-        task_key = _state_value(state_values, task_block_id, "task_select", "selected_option")
-        category_key = _state_value(
-            state_values, category_block_id, "category_select", "selected_option"
-        )
+        project_key = _read_row_project(state_values, row_index)
+        task_key = _read_row_task(state_values, row_index, project_key)
+        category_key = _read_row_category(state_values, row_index, task_key)
         accomplishment = _state_value(state_values, accomplishment_block_id, "accomplishment_input")
 
         # Completely empty → treat as Break (not recorded; no break tally).
@@ -537,12 +673,13 @@ def _parse_modal_submission(state_values: dict, user_name: str) -> tuple[list[jm
 
         if task_key in PLACEHOLDER_TASK_VALUES:
             task_key = None
+        if category_key in PLACEHOLDER_CATEGORY_VALUES:
+            category_key = None
 
         missing_fields = []
         if not task_key:
             missing_fields.append("task")
-        if not category_key:
-            missing_fields.append("category")
+        # Category is optional (tasks may have none, or the user may leave it blank).
         if not accomplishment or not accomplishment.strip():
             missing_fields.append("accomplishment")
         # Slack only accepts view errors on input blocks, not actions blocks.
@@ -559,25 +696,20 @@ def _parse_modal_submission(state_values: dict, user_name: str) -> tuple[list[jm
                 user=user_name,
                 hours=hours,
                 task=task_key,
-                category=category_key,
+                category=category_key or "",
                 activity=accomplishment.strip(),
                 project_key=project_key,
             )
         )
 
     if not entries and not errors:
-        errors[_entry_block_ids(0)[3]] = "Fill out at least one work entry before submitting."
+        errors[_accomplishment_block_id(0)] = "Fill out at least one work entry before submitting."
 
     return entries, errors, break_hours
 
 
-def _maybe_expand_logtime_view(ack, body, client) -> None:
-    """Ack and rebuild the modal with an extra blank row when all slots are filled."""
-    _rebuild_logtime_view(ack, body, client, force=False)
-
-
-def _rebuild_logtime_view(ack, body, client, *, force: bool) -> None:
-    """Rebuild logtime modal from current state (always when force=True)."""
+def _rebuild_logtime_view(ack, body, client, *, force: bool = True) -> None:
+    """Rebuild logtime modal from current state (cascading dropdowns / add entry)."""
     ack()
     view = body.get("view") or {}
     state = _sanitize_task_selections(dict(view.get("state", {}).get("values", {}) or {}))
@@ -585,12 +717,9 @@ def _rebuild_logtime_view(ack, body, client, *, force: bool) -> None:
         meta = json.loads(view.get("private_metadata") or "{}")
     except Exception:
         meta = {}
-    current = int(meta.get("row_count") or _row_count_from_view_state(state))
-    desired = _row_count_for_state(state, current)
-    if not force and desired <= current:
-        return
-    meta["row_count"] = max(desired, current) if force else desired
-    row_count = meta["row_count"]
+    row_count = int(meta.get("row_count") or _row_count_from_view_state(state) or MIN_ENTRY_ROWS)
+    row_count = min(MAX_ENTRY_ROWS, max(MIN_ENTRY_ROWS, row_count))
+    meta["row_count"] = row_count
     updated = build_logtime_modal(row_count=row_count, preserve_state=state)
     updated["private_metadata"] = json.dumps(meta)
     try:
@@ -665,23 +794,233 @@ def _build_create_named_modal(kind: str, parent_meta: dict) -> dict:
                 ],
             }
         )
+    if kind == "category":
+        task_name = parent_meta.get("task_name") or parent_meta.get("task_id") or "this task"
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"This category will only appear for task *{task_name}*.",
+                    }
+                ],
+            }
+        )
     return {
         "type": "modal",
         "callback_id": f"create_{kind}_modal",
         "title": {"type": "plain_text", "text": titles[kind]},
         "submit": {"type": "plain_text", "text": "Create"},
         "close": {"type": "plain_text", "text": "Cancel"},
-        "private_metadata": json.dumps(parent_meta),
+        "private_metadata": json.dumps(
+            _trim_parent_meta_for_slack(parent_meta), separators=(",", ":")
+        ),
         "blocks": blocks,
     }
 
 
-def _refresh_parent_logtime(client, parent_meta: dict) -> None:
+def _snapshot_logtime_rows(state: dict | None, row_count: int) -> list[dict]:
+    """Compact entry snapshot for create-modal private_metadata (≤3000 chars)."""
+    rows: list[dict] = []
+    for i in range(max(MIN_ENTRY_ROWS, int(row_count or MIN_ENTRY_ROWS))):
+        activity = _state_value(state, _accomplishment_block_id(i), "accomplishment_input") or ""
+        hours = (
+            _state_value(
+                state, _duration_block_id(i), "entry_duration_select", "selected_option"
+            )
+            or DEFAULT_ENTRY_DURATION
+        )
+        rows.append(
+            {
+                "p": _read_row_project(state, i) or "",
+                "t": _read_row_task(state, i) or "",
+                "c": _read_row_category(state, i) or "",
+                "h": hours,
+                "a": str(activity)[:400],
+            }
+        )
+    return rows
+
+
+def _preserve_from_snapshot(rows: list | None) -> dict:
+    """Rebuild Slack-shaped preserve_state from a compact snapshot."""
+    state: dict = {}
+    if not isinstance(rows, list):
+        return state
+    for i, row in enumerate(rows[:MAX_ENTRY_ROWS]):
+        if not isinstance(row, dict):
+            continue
+        project_key = str(row.get("p") or "")
+        task_key = str(row.get("t") or "")
+        category_key = str(row.get("c") or "")
+        hours = str(row.get("h") or DEFAULT_ENTRY_DURATION)
+        activity = str(row.get("a") or "")
+        if hours not in ENTRY_DURATION_VALUES:
+            hours = DEFAULT_ENTRY_DURATION
+        if task_key in PLACEHOLDER_TASK_VALUES:
+            task_key = ""
+        if category_key in PLACEHOLDER_CATEGORY_VALUES:
+            category_key = ""
+        (
+            project_block_id,
+            task_block_id,
+            category_block_id,
+            accomplishment_block_id,
+        ) = _entry_block_ids(
+            i, project_key=project_key or None, task_key=task_key or None
+        )
+        state[_duration_block_id(i)] = {
+            "entry_duration_select": {"selected_option": {"value": hours}}
+        }
+        if project_key:
+            state[project_block_id] = {
+                "project_select": {"selected_option": {"value": project_key}}
+            }
+        if task_key:
+            state[task_block_id] = {
+                "task_select": {"selected_option": {"value": task_key}}
+            }
+        if category_key and task_key:
+            state[category_block_id] = {
+                "category_select": {"selected_option": {"value": category_key}}
+            }
+        if activity:
+            state[accomplishment_block_id] = {
+                "accomplishment_input": {"value": activity}
+            }
+    return state
+
+
+def _apply_created_selection(
+    preserve: dict,
+    *,
+    row_index: int,
+    project_id: str = "",
+    task_id: str = "",
+    select_task_id: str | None = None,
+    select_category_id: str | None = None,
+    select_project_id: str | None = None,
+) -> dict:
+    """Force-select a newly created project/task/category on the active entry row."""
+    row_index = max(0, min(MAX_ENTRY_ROWS - 1, int(row_index or 0)))
+    project_id = (project_id or "").strip()
+    task_id = (task_id or "").strip()
+
+    if select_project_id:
+        project_id = select_project_id
+        preserve[_project_block_id(row_index)] = {
+            "project_select": {"selected_option": {"value": select_project_id}}
+        }
+        _pop_blocks_with_prefix(preserve, f"entry_{row_index}_task_block")
+        _pop_blocks_with_prefix(preserve, f"entry_{row_index}_category_block")
+
+    if select_task_id:
+        if not project_id:
+            project_id = _read_row_project(preserve, row_index) or ""
+        _pop_blocks_with_prefix(preserve, f"entry_{row_index}_task_block")
+        _pop_blocks_with_prefix(preserve, f"entry_{row_index}_category_block")
+        preserve[_task_block_id(row_index, project_id or None)] = {
+            "task_select": {"selected_option": {"value": select_task_id}}
+        }
+        task_id = select_task_id
+
+    if select_category_id:
+        if not task_id:
+            task_id = _read_row_task(preserve, row_index, project_id or None) or ""
+        if not project_id:
+            project_id = _read_row_project(preserve, row_index) or ""
+        _pop_blocks_with_prefix(preserve, f"entry_{row_index}_category_block")
+        if task_id:
+            if project_id:
+                preserve[_task_block_id(row_index, project_id)] = {
+                    "task_select": {"selected_option": {"value": task_id}}
+                }
+            preserve[_category_block_id(row_index, task_id)] = {
+                "category_select": {"selected_option": {"value": select_category_id}}
+            }
+    return preserve
+
+
+def _trim_parent_meta_for_slack(meta: dict) -> dict:
+    """Keep create-modal private_metadata under Slack's 3000-character limit."""
+    payload = dict(meta)
+    encoded = json.dumps(payload, separators=(",", ":"))
+    if len(encoded) <= 3000:
+        return payload
+    rows = payload.get("rows")
+    if isinstance(rows, list):
+        for row in rows:
+            if isinstance(row, dict):
+                row["a"] = ""
+        encoded = json.dumps(payload, separators=(",", ":"))
+        if len(encoded) <= 3000:
+            return payload
+        row_index = int(payload.get("row_index") or 0)
+        trimmed = [
+            {"p": "", "t": "", "c": "", "h": DEFAULT_ENTRY_DURATION, "a": ""}
+            for _ in rows
+        ]
+        if 0 <= row_index < len(rows) and isinstance(rows[row_index], dict):
+            keep = dict(rows[row_index])
+            keep["a"] = ""
+            trimmed[row_index] = keep
+        payload["rows"] = trimmed
+    return payload
+
+
+def _enrich_create_parent_meta(
+    parent_meta: dict,
+    *,
+    view: dict,
+    state: dict | None,
+    row_index: int,
+) -> dict:
+    """Attach channel/user/row snapshot used to restore + auto-select after create."""
+    root_meta: dict = {}
+    try:
+        root_meta = json.loads(view.get("private_metadata") or "{}")
+    except Exception:
+        root_meta = {}
+    parent_meta["channel_id"] = root_meta.get("channel_id") or parent_meta.get("channel_id") or ""
+    parent_meta["user_id"] = (
+        root_meta.get("user_id") or parent_meta.get("user_id") or ""
+    )
+    parent_meta["row_index"] = int(row_index or 0)
+    row_count = int(
+        root_meta.get("row_count")
+        or _row_count_from_view_state(state)
+        or MIN_ENTRY_ROWS
+    )
+    parent_meta["row_count"] = min(MAX_ENTRY_ROWS, max(MIN_ENTRY_ROWS, row_count))
+    parent_meta["rows"] = _snapshot_logtime_rows(state, parent_meta["row_count"])
+    return parent_meta
+
+
+def _refresh_parent_logtime(
+    client,
+    parent_meta: dict,
+    *,
+    select_task_id: str | None = None,
+    select_category_id: str | None = None,
+    select_project_id: str | None = None,
+) -> None:
     view_id = parent_meta.get("parent_view_id")
     if not view_id:
         return
     row_count = int(parent_meta.get("row_count") or MIN_ENTRY_ROWS)
-    updated = build_logtime_modal(row_count=row_count)
+    row_count = min(MAX_ENTRY_ROWS, max(MIN_ENTRY_ROWS, row_count))
+    preserve = _preserve_from_snapshot(parent_meta.get("rows"))
+    _apply_created_selection(
+        preserve,
+        row_index=int(parent_meta.get("row_index") or 0),
+        project_id=str(parent_meta.get("project_id") or ""),
+        task_id=str(parent_meta.get("task_id") or ""),
+        select_task_id=select_task_id,
+        select_category_id=select_category_id,
+        select_project_id=select_project_id,
+    )
+    updated = build_logtime_modal(row_count=row_count, preserve_state=preserve)
     root_meta = {
         "channel_id": parent_meta.get("channel_id", ""),
         "user_id": parent_meta.get("user_id", ""),
@@ -810,22 +1149,41 @@ def handle_project_select(ack, body, client):
 
 @app.action("task_select")
 def handle_task_select(ack, body, client):
-    _maybe_expand_logtime_view(ack, body, client)
+    # Rebuild so the Category dropdown switches to this task's categories.
+    _rebuild_logtime_view(ack, body, client, force=True)
 
 
 @app.action("category_select")
 def handle_category_select(ack, body, client):
-    _maybe_expand_logtime_view(ack, body, client)
+    ack()
 
 
 @app.action("entry_duration_select")
 def handle_entry_duration_select(ack, body, client):
-    _maybe_expand_logtime_view(ack, body, client)
+    ack()
 
 
-@app.action("accomplishment_input")
-def handle_accomplishment_input(ack, body, client):
-    _maybe_expand_logtime_view(ack, body, client)
+@app.action("add_entry_btn")
+def handle_add_entry_btn(ack, body, client):
+    ack()
+    view = body.get("view") or {}
+    state = _sanitize_task_selections(dict(view.get("state", {}).get("values", {}) or {}))
+    try:
+        meta = json.loads(view.get("private_metadata") or "{}")
+    except Exception:
+        meta = {}
+    current = int(meta.get("row_count") or _row_count_from_view_state(state) or MIN_ENTRY_ROWS)
+    meta["row_count"] = min(MAX_ENTRY_ROWS, max(MIN_ENTRY_ROWS, current + 1))
+    updated = build_logtime_modal(row_count=meta["row_count"], preserve_state=state)
+    updated["private_metadata"] = json.dumps(meta)
+    try:
+        client.views_update(
+            view_id=view.get("id"),
+            hash=view.get("hash"),
+            view=updated,
+        )
+    except Exception as exc:
+        print(f"[SLACK WARNING] Could not add entry row: {exc}", flush=True)
 
 
 def _push_create_modal(ack, body, client, kind: str):
@@ -833,14 +1191,18 @@ def _push_create_modal(ack, body, client, kind: str):
     trigger_id = body.get("trigger_id")
     if not trigger_id:
         return
-    parent_meta = _parent_metadata_from_view(body.get("view") or {})
-    root_meta = {}
+    view = body.get("view") or {}
+    state = view.get("state", {}).get("values", {}) or {}
+    actions = body.get("actions") or []
     try:
-        root_meta = json.loads((body.get("view") or {}).get("private_metadata") or "{}")
-    except Exception:
-        root_meta = {}
-    parent_meta["channel_id"] = root_meta.get("channel_id", "")
-    parent_meta["user_id"] = root_meta.get("user_id") or body.get("user", {}).get("id", "")
+        row_index = int((actions[0] or {}).get("value") or 0)
+    except (TypeError, ValueError, IndexError):
+        row_index = 0
+    parent_meta = _parent_metadata_from_view(view)
+    parent_meta["user_id"] = body.get("user", {}).get("id", "")
+    _enrich_create_parent_meta(
+        parent_meta, view=view, state=state, row_index=row_index
+    )
     client.views_push(
         trigger_id=trigger_id,
         view=_build_create_named_modal(kind, parent_meta),
@@ -864,17 +1226,16 @@ def handle_create_task_btn(ack, body, client):
         row_index = int((actions[0] or {}).get("value") or 0)
     except (TypeError, ValueError, IndexError):
         row_index = 0
-    state = view.get("state", {}).get("values", {})
-    project_block_id, _, _, _ = _entry_block_ids(row_index)
-    project_id = _state_value(state, project_block_id, "project_select", "selected_option")
+    state = view.get("state", {}).get("values", {}) or {}
+    project_id = _read_row_project(state, row_index)
     user_id = body.get("user", {}).get("id", "")
-    channel_id = ""
-    try:
-        root_meta = json.loads(view.get("private_metadata") or "{}")
-        channel_id = root_meta.get("channel_id") or ""
-        user_id = root_meta.get("user_id") or user_id
-    except Exception:
-        root_meta = {}
+
+    parent_meta = _parent_metadata_from_view(view)
+    parent_meta["user_id"] = user_id
+    _enrich_create_parent_meta(
+        parent_meta, view=view, state=state, row_index=row_index
+    )
+    channel_id = parent_meta.get("channel_id") or ""
 
     if not project_id or project_id == BREAK_PROJECT_VALUE:
         client.chat_postEphemeral(
@@ -884,11 +1245,7 @@ def handle_create_task_btn(ack, body, client):
         )
         return
 
-    parent_meta = _parent_metadata_from_view(view)
-    parent_meta["channel_id"] = channel_id
-    parent_meta["user_id"] = user_id
     parent_meta["project_id"] = project_id
-    parent_meta["row_index"] = row_index
     try:
         project = firestore_store.get_project(project_id)
         parent_meta["project_name"] = project.name if project else project_id
@@ -902,7 +1259,47 @@ def handle_create_task_btn(ack, body, client):
 
 @app.action("create_category_btn")
 def handle_create_category_btn(ack, body, client):
-    _push_create_modal(ack, body, client, "category")
+    ack()
+    trigger_id = body.get("trigger_id")
+    if not trigger_id:
+        return
+    view = body.get("view") or {}
+    actions = body.get("actions") or []
+    try:
+        row_index = int((actions[0] or {}).get("value") or 0)
+    except (TypeError, ValueError, IndexError):
+        row_index = 0
+    state = view.get("state", {}).get("values", {}) or {}
+    project_id = _read_row_project(state, row_index)
+    task_id = _read_row_task(state, row_index, project_id)
+    user_id = body.get("user", {}).get("id", "")
+
+    parent_meta = _parent_metadata_from_view(view)
+    parent_meta["user_id"] = user_id
+    _enrich_create_parent_meta(
+        parent_meta, view=view, state=state, row_index=row_index
+    )
+    channel_id = parent_meta.get("channel_id") or ""
+
+    if not task_id or task_id in PLACEHOLDER_TASK_VALUES:
+        client.chat_postEphemeral(
+            channel=channel_id or user_id,
+            user=user_id,
+            text="Select a task on that entry first, then use *+* to add a category for it.",
+        )
+        return
+
+    parent_meta["project_id"] = project_id or ""
+    parent_meta["task_id"] = task_id
+    try:
+        task = firestore_store.get_task(task_id)
+        parent_meta["task_name"] = task.name if task else task_id
+    except Exception:
+        parent_meta["task_name"] = task_id
+    client.views_push(
+        trigger_id=trigger_id,
+        view=_build_create_named_modal("category", parent_meta),
+    )
 
 
 @app.view("create_task_modal")
@@ -925,7 +1322,7 @@ def handle_create_task_modal(ack, body, client, view):
         ack(response_action="errors", errors={"name_block": f"Could not create task: {exc}"})
         return
     ack()
-    _refresh_parent_logtime(client, parent_meta)
+    _refresh_parent_logtime(client, parent_meta, select_task_id=created.id)
     user_id = body.get("user", {}).get("id") or parent_meta.get("user_id")
     project_label = parent_meta.get("project_name") or project_id
     if user_id:
@@ -933,8 +1330,8 @@ def handle_create_task_modal(ack, body, client, view):
             channel=parent_meta.get("channel_id") or user_id,
             user=user_id,
             text=(
-                f"✅ Created task *{created.name}* for *{project_label}*. "
-                "It is now in that project's Task dropdown."
+                f"✅ Created task *{created.name}* for *{project_label}* "
+                "and selected it on that entry."
             ),
         )
 
@@ -942,25 +1339,35 @@ def handle_create_task_modal(ack, body, client, view):
 @app.view("create_category_modal")
 def handle_create_category_modal(ack, body, client, view):
     name = (_state_value(view.get("state", {}).get("values", {}), "name_block", "name_input") or "").strip()
+    parent_meta = json.loads(view.get("private_metadata") or "{}")
+    task_id = (parent_meta.get("task_id") or "").strip()
     if not name:
         ack(response_action="errors", errors={"name_block": "Enter a category name."})
         return
+    if not task_id:
+        ack(
+            response_action="errors",
+            errors={
+                "name_block": "Select a task on the entry, then create the category again."
+            },
+        )
+        return
     try:
-        created = firestore_store.create_category(name)
+        created = firestore_store.create_category(name, task_id)
     except Exception as exc:
         ack(response_action="errors", errors={"name_block": f"Could not create category: {exc}"})
         return
     ack()
-    parent_meta = json.loads(view.get("private_metadata") or "{}")
-    _refresh_parent_logtime(client, parent_meta)
+    _refresh_parent_logtime(client, parent_meta, select_category_id=created.id)
     user_id = body.get("user", {}).get("id") or parent_meta.get("user_id")
+    task_label = parent_meta.get("task_name") or task_id
     if user_id:
         client.chat_postEphemeral(
             channel=parent_meta.get("channel_id") or user_id,
             user=user_id,
             text=(
-                f"✅ Created category *{created.name}* (`{created.id}`). "
-                "It is now in the Category dropdown."
+                f"✅ Created category *{created.name}* for task *{task_label}* "
+                "and selected it on that entry."
             ),
         )
 
@@ -1038,7 +1445,7 @@ def handle_create_project_modal(ack, body, client, view):
             "blocks": blocks,
         },
     )
-    _refresh_parent_logtime(client, parent_meta)
+    _refresh_parent_logtime(client, parent_meta, select_project_id=created.id)
 
 
 @app.action("open_drive_picker_link")
@@ -1104,23 +1511,23 @@ def handle_logtime_submission(ack, body, client, view):
 
     if entries and user_id:
         try:
+            # Prefill memory is Entry 1 only — later entries are not reused next time.
+            first = entries[0]
             firestore_store.set_last_logtime(
                 user_id,
                 duration,
                 [
                     firestore_store.LastLogEntry(
-                        project_key=entry.project_key,
-                        task=entry.task,
-                        category=entry.category,
-                        activity=entry.activity,
-                        hours=_hours_to_option_value(entry.hours),
+                        project_key=first.project_key,
+                        task=first.task,
+                        category=first.category,
+                        activity=first.activity,
+                        hours=_hours_to_option_value(first.hours),
                     )
-                    for entry in entries
                 ],
             )
             print(
-                f"[FIRESTORE] Saved last_logtime for {user_id}: "
-                f"{len(entries)} entr(y/ies)",
+                f"[FIRESTORE] Saved last_logtime for {user_id}: Entry 1 only",
                 flush=True,
             )
         except Exception as exc:
