@@ -3,10 +3,10 @@ AEC Agent Journal Integration.
 
 Architecture:
   - Google Sheets = source of truth for Detailed Activity Log, Total Hours,
-    Actual Hours by Category (formulas), and Estimate hours (manual).
-    Dashboard includes an Actual vs Estimate bar chart.
+    Hours by Task / Task Budget (Completed vs Estimated $), and the task
+    progress bar chart.
   - Google Docs = client narrative (Gemini) plus Hours/Activity text synced
-    from Sheets, with the category bar chart re-embedded as an image on each
+    from Sheets, with the task budget chart re-embedded as an image on each
     Activity Log update (Docs API cannot refresh native linked charts).
 """
 
@@ -16,7 +16,9 @@ import io
 import json
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import google.auth
 from google import genai
@@ -48,7 +50,8 @@ HEADING1_FONT_PT = 14
 HEADING1_TITLES = (
     "Weekly Summary",
     "Hours Summary",
-    "Hours by Category:",
+    "Hours by Task:",
+    "Hours by Category:",  # legacy docs
     "Category Chart",
     "Detailed Activity Log",
 )
@@ -163,13 +166,13 @@ def ensure_document_heading_styles(document_id: str, service=None) -> bool:
         return False
 
 
-def _is_bold_normal_paragraph(text: str, category_labels: set[str]) -> bool:
+def _is_bold_normal_paragraph(text: str, name_labels: set[str]) -> bool:
     stripped = text.strip()
     if stripped in BOLD_NORMAL_EXACT_TITLES:
         return True
     if stripped.startswith("Total Hours:"):
         return True
-    if stripped in category_labels:
+    if stripped in name_labels:
         return True
     return False
 
@@ -177,14 +180,16 @@ def _is_bold_normal_paragraph(text: str, category_labels: set[str]) -> bool:
 def apply_document_heading_styles(document_id: str, service=None) -> tuple[int, int]:
     """
     Apply Heading 1 to section titles, and Normal text + bold to
-    Accomplishments / Total Hours / category names.
+    Accomplishments / Total Hours / task names.
     Returns (h1_count, bold_normal_count).
     """
     service = service or get_docs_service()
     document = get_document(service, document_id)
     body_content = _collect_body_elements(document)
     h1_titles = {t.strip() for t in HEADING1_TITLES}
-    category_labels = set(jm.category_labels_map().values())
+    name_labels = set(jm.task_labels_map().values()) | set(
+        jm.category_labels_map().values()
+    )
     requests: list[dict] = []
     h1_count = 0
     bold_count = 0
@@ -205,7 +210,7 @@ def apply_document_heading_styles(document_id: str, service=None) -> tuple[int, 
                 )
             )
             h1_count += 1
-        elif _is_bold_normal_paragraph(text, category_labels):
+        elif _is_bold_normal_paragraph(text, name_labels):
             requests.extend(
                 _style_paragraph_requests(
                     start,
@@ -612,29 +617,198 @@ def _trash_drive_file(file_id: str) -> None:
         print(f"  [JOURNAL WARNING] Could not trash temp chart file {file_id}: {exc}")
 
 
+def compile_task_budget_outlook(
+    project_name: str,
+    *,
+    start_date: str,
+    estimated_end_date: str,
+    as_of_date: str,
+    remaining_weeks: int | None,
+    tasks: list[dict],
+) -> str:
+    """
+    Ask Gemini for a succinct 2-3 sentence budget projection based on
+    Firestore project dates and each task's completed / estimated / avg weekly spend.
+    """
+    fallback = (
+        "Budget outlook: set Project Estimated End Date and each task's "
+        "Estimated $ on the Dashboard to enable on-budget projections. "
+        "Avg Weekly Spend is calculated from Completed $."
+    )
+    if not tasks:
+        return fallback
+
+    remaining_weeks_text = (
+        str(remaining_weeks)
+        if remaining_weeks is not None
+        else "(unknown — estimated_end_date missing)"
+    )
+    system_instruction = """
+You are a concise project controls analyst for an architecture/engineering firm.
+Write exactly 2-3 short sentences (no bullets, no headings) assessing whether
+each task is projected to finish on budget by the project's estimated end date.
+
+Authoritative inputs are provided in the user message (from Firestore). Treat them
+as complete — do not ask for a current date, and do not say a current date is
+needed when as_of_date and/or remaining_weeks are provided.
+
+Use only the numbers provided:
+- remaining_budget = estimated - completed
+- remaining_weeks is already computed from as_of_date → estimated_end_date
+- If avg_weekly_spend > 0 and remaining_weeks is known, compare
+  remaining_weeks vs remaining_budget / avg_weekly_spend
+- Say clearly which tasks look on track vs at risk of overrunning
+- If estimated_end_date or avg weekly spend are missing/zero, say projections
+  are limited — but never invent a missing "current date" complaint
+- Do not discuss the duration needed to complete the project; billable money
+  does not equate to completeness of the work
+Do not invent numbers. Keep total length under 80 words.
+"""
+    user_prompt = f"""
+Project: {project_name}
+Project start date (Firestore): {start_date or "(not set)"}
+Project estimated end date (Firestore): {estimated_end_date or "(not set)"}
+As-of date (today): {as_of_date or "(not set)"}
+Remaining weeks until estimated end: {remaining_weeks_text}
+Tasks JSON (Firestore):
+{json.dumps(tasks, indent=2)}
+"""
+    try:
+        ai_client = _get_genai_client()
+        response = ai_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=user_prompt,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=0.2,
+            ),
+        )
+        text = (getattr(response, "text", None) or "").strip()
+        if text:
+            return text
+    except Exception as exc:
+        print(f"  [JOURNAL WARNING] Budget outlook generation failed: {exc}")
+    return fallback
+
+
+def _remaining_weeks_until(end_iso: str, as_of_iso: str) -> int | None:
+    """Whole weeks from as_of through estimated_end_date; None if end is blank."""
+    from datetime import date as date_cls
+
+    end_iso = (end_iso or "").strip()
+    as_of_iso = (as_of_iso or "").strip()
+    if not end_iso or not as_of_iso:
+        return None
+    try:
+        end_d = date_cls.fromisoformat(end_iso[:10])
+        as_of_d = date_cls.fromisoformat(as_of_iso[:10])
+    except ValueError:
+        return None
+    days = (end_d - as_of_d).days
+    if days < 0:
+        return 0
+    return days // 7
+
+
 def sync_category_chart_into_doc(
     document_id: str,
     spreadsheet_id: str,
     service=None,
+    project_key: str = "",
+    project_name: str = "",
 ) -> bool:
     """
-    Rebuild Actual vs Estimate bar chart image between CHART markers.
-    Regenerated whenever Sheets Activity Log / Dashboard data is synced.
+    Rebuild task budget progress chart + Gemini budget outlook between CHART markers.
+
+    Outlook inputs (dates + task money fields) come primarily from Firestore.
     """
     service = service or get_docs_service()
     if CHART_START not in read_document_text(document_id, service=service):
         _ensure_chart_markers(document_id, service=service)
 
     sheets = agent_sheets.get_sheets_service()
-    agent_sheets.ensure_category_estimate_table(sheets, spreadsheet_id)
-    agent_sheets.ensure_category_bar_chart(sheets, spreadsheet_id)
+    agent_sheets.ensure_category_estimate_table(
+        sheets, spreadsheet_id, project_key=project_key
+    )
 
-    category_rows = agent_sheets.get_dashboard_category_rows(spreadsheet_id, sheets=sheets)
-    if not category_rows:
-        labels = list(jm.category_labels_map().values())
-        category_rows = [(label, 0.0, 0.0) for label in labels]
+    # Sheet rows only for chart fallback if Firestore has no tasks yet.
+    sheet_task_rows = agent_sheets.get_dashboard_task_rows(
+        spreadsheet_id, sheets=sheets
+    )
 
-    png_bytes = agent_sheets.render_category_bar_chart_png(category_rows)
+    start_date = ""
+    end_date = ""
+    tasks_payload: list[dict] = []
+    task_rows: list[tuple[str, float, float]] = []
+    try:
+        import firestore_store
+
+        key = (project_key or "").strip()
+        if not key:
+            key = agent_sheets._read_stored_project_key(sheets, spreadsheet_id)
+        if key:
+            proj = firestore_store.get_project(key)
+            if proj:
+                start_date = (proj.start_date or "").strip()
+                end_date = (proj.estimated_end_date or "").strip()
+                project_name = project_name or proj.name
+                print(
+                    f"  [JOURNAL] Outlook schedule from Firestore `{key}`: "
+                    f"start={start_date or '(blank)'} end={end_date or '(blank)'}",
+                    flush=True,
+                )
+            fs_tasks = firestore_store.list_tasks(key)
+            for ft in fs_tasks:
+                completed = int(ft.completed or 0)
+                estimated = int(ft.estimated or 0)
+                avg_weekly = int(ft.avg_weekly_spend or 0)
+                tasks_payload.append(
+                    {
+                        "task": ft.name,
+                        "completed": completed,
+                        "estimated": estimated,
+                        "avg_weekly_spend": avg_weekly,
+                        "remaining": max(0, estimated - completed),
+                    }
+                )
+                task_rows.append((ft.name, float(completed), float(estimated)))
+    except Exception as exc:
+        print(f"  [JOURNAL WARNING] Could not load Firestore outlook data: {exc}")
+
+    # Fallback to sheet values only when Firestore had no task rows.
+    if not tasks_payload and sheet_task_rows:
+        for label, completed, estimated in sheet_task_rows:
+            if label in {"(no tasks yet)", ""}:
+                continue
+            c = int(round(completed))
+            e = int(round(estimated))
+            tasks_payload.append(
+                {
+                    "task": label,
+                    "completed": c,
+                    "estimated": e,
+                    "avg_weekly_spend": 0,
+                    "remaining": max(0, e - c),
+                }
+            )
+            task_rows.append((label, float(c), float(e)))
+
+    if not task_rows:
+        task_rows = [("(no tasks yet)", 0.0, 0.0)]
+
+    as_of_date = datetime.now(ZoneInfo(jm.JOURNAL_TIMEZONE)).date().isoformat()
+    remaining_weeks = _remaining_weeks_until(end_date, as_of_date)
+
+    outlook = compile_task_budget_outlook(
+        project_name or "Project",
+        start_date=start_date,
+        estimated_end_date=end_date,
+        as_of_date=as_of_date,
+        remaining_weeks=remaining_weeks,
+        tasks=tasks_payload,
+    )
+
+    png_bytes = agent_sheets.render_task_progress_chart_png(task_rows)
     file_id = ""
     try:
         folder_id = _folder_id_for_spreadsheet(spreadsheet_id)
@@ -665,19 +839,21 @@ def sync_category_chart_into_doc(
                     }
                 }
             )
-        # Placeholder newlines, then insert image between them.
+        # Outlook text, blank line, then image placeholder.
+        intro = f"{outlook.strip()}\n\n \n"
         requests.append(
             {
                 "insertText": {
                     "location": {"index": start_end},
-                    "text": "\n \n",
+                    "text": intro,
                 }
             }
         )
+        image_index = start_end + len(intro) - 2  # on the space before final newline
         requests.append(
             {
                 "insertInlineImage": {
-                    "location": {"index": start_end + 1},
+                    "location": {"index": image_index},
                     "uri": uri,
                     "objectSize": {
                         "height": {"magnitude": 280, "unit": "PT"},
@@ -691,7 +867,13 @@ def sync_category_chart_into_doc(
             documentId=document_id,
             body={"requests": requests},
         ).execute()
-        print("  [JOURNAL] Synced Actual vs Estimate chart image into Doc.")
+
+        # Outlook inherits Heading 1 from "Category Chart" — force Normal Text.
+        outlook_end = start_end + len(outlook.strip()) + 2  # outlook + "\n\n"
+        _force_normal_text_range(
+            document_id, start_end, outlook_end, service=service
+        )
+        print("  [JOURNAL] Synced budget outlook + task chart into Doc.")
         return True
     except Exception as exc:
         print(f"  [JOURNAL ERROR] Chart image sync failed: {exc}")
@@ -706,53 +888,62 @@ def sync_sheet_sections_into_doc(
     spreadsheet_id: str,
     project_name: str,
     service=None,
+    project_key: str = "",
 ) -> bool:
     """
     Copy Hours + Activity Log from Sheets into the Google Doc marker sections,
-    and re-embed the Actual vs Estimate bar chart below Hours by Category.
+    and re-embed the task budget progress chart below Hours by Task.
     """
     service = service or get_docs_service()
     week_start, week_end, week_label = jm.get_current_week_range()
     entries = agent_sheets.read_week_entries(
         spreadsheet_id, week_start=week_start, week_end=week_end
     )
-    total_hours, hours_by_category = agent_sheets.get_dashboard_totals(spreadsheet_id)
-    category_rows = agent_sheets.get_dashboard_category_rows(spreadsheet_id)
-    if not hours_by_category:
-        hours_by_category = jm.compute_hours_by_category(entries)
+    total_hours, _hours_by_category = agent_sheets.get_dashboard_totals(spreadsheet_id)
+    task_rows = agent_sheets.get_dashboard_task_rows(spreadsheet_id)
+    hours_by_task = jm.compute_hours_by_task(entries)
     if not total_hours:
         total_hours = round(sum(entry.hours for entry in entries), 2)
 
-    estimates = {label: estimate for label, _actual, estimate in category_rows}
+    estimates = {label: estimate for label, _completed, estimate in task_rows}
+    completed_by_task = {
+        label: completed for label, completed, _estimate in task_rows
+    }
 
     hours_lines = [
         f"Week of: {week_label}",
         f"Total Hours: {total_hours:g}",
         "",
-        "Hours by Category:",
+        "Hours by Task:",
     ]
-    if hours_by_category or estimates:
-        labels = list(hours_by_category.keys()) or [r[0] for r in category_rows]
-        # Prefer Dashboard category order when available.
-        if category_rows:
-            labels = [r[0] for r in category_rows]
-        for category in labels:
-            actual = hours_by_category.get(category, 0.0)
-            estimate = estimates.get(category, 0.0)
-            # Category name alone so it can receive Heading 2 styling.
-            hours_lines.append(category)
-            if estimate:
-                hours_lines.append(
-                    f"Actual {actual:g} hrs | Estimate {estimate:g} hrs"
-                )
-            else:
-                hours_lines.append(
-                    f"Actual {actual:g} hrs | Estimate (enter in Sheet)"
-                )
-            hours_lines.append("")
+    if hours_by_task or estimates or completed_by_task or task_rows:
+        # Prefer Dashboard task order; include any tasks logged this week.
+        labels = [r[0] for r in task_rows] if task_rows else list(hours_by_task.keys())
+        for name in hours_by_task:
+            if name not in labels:
+                labels.append(name)
+        if not labels:
+            hours_lines.append("(none this week)")
+        else:
+            for task_name in labels:
+                if task_name == "(no tasks yet)":
+                    continue
+                actual = hours_by_task.get(task_name, 0.0)
+                estimate = estimates.get(task_name, 0.0)
+                completed = completed_by_task.get(task_name, 0.0)
+                # Task name alone so it can receive bold Normal styling.
+                hours_lines.append(task_name)
+                if estimate:
+                    hours_lines.append(
+                        f"Actual {actual:g} hrs | Completed ${completed:g} | Estimated ${estimate:g}"
+                    )
+                else:
+                    hours_lines.append(
+                        f"Actual {actual:g} hrs | Completed ${completed:g} | Estimated $ (enter in Sheet)"
+                    )
+                hours_lines.append("")
     else:
         hours_lines.append("(none this week)")
-    
 
     activity_lines = ["Timestamp | User | Hours | Task | Category | Activity"]
     for entry in entries:
@@ -771,7 +962,11 @@ def sync_sheet_sections_into_doc(
         service=service,
     )
     chart_ok = sync_category_chart_into_doc(
-        document_id, spreadsheet_id, service=service
+        document_id,
+        spreadsheet_id,
+        service=service,
+        project_key=project_key,
+        project_name=project_name,
     )
     activity_ok = replace_section_body(
         document_id,
@@ -803,12 +998,15 @@ def compile_weekly_summary(
     week_label: str,
     total_hours: float | None = None,
     hours_by_category: dict[str, float] | None = None,
+    hours_by_task: dict[str, float] | None = None,
 ) -> Optional[dict]:
     if not entries:
         return None
 
     if total_hours is None:
         total_hours = round(sum(entry.hours for entry in entries), 2)
+    if hours_by_task is None:
+        hours_by_task = jm.compute_hours_by_task(entries)
     if hours_by_category is None:
         hours_by_category = jm.compute_hours_by_category(entries)
 
@@ -830,6 +1028,7 @@ Rules:
 Project: {project_name}
 Week: {week_label}
 Total hours (verified): {total_hours}
+Hours by task (verified): {json.dumps(hours_by_task)}
 Hours by category (verified): {json.dumps(hours_by_category)}
 
 Log entries (JSON):
@@ -872,7 +1071,7 @@ def render_doc_narrative(accomplishments_narrative: str) -> str:
     return (
         "Accomplishments\n"
         f"{narrative}\n\n"
-        "_Total Hours and Hours by Category are maintained in the linked Google Sheet "
+        "_Total Hours and Hours by Task are maintained in the linked Google Sheet "
         "Dashboard and synced into the Hours Summary section below._\n"
     )
 
@@ -882,9 +1081,12 @@ def _update_summary_from_sheet(
     spreadsheet_id: str,
     project_name: str,
     service,
+    project_key: str = "",
 ) -> bool:
     week_start, week_end, week_label = jm.get_current_week_range()
-    agent_sheets.update_dashboard_week(spreadsheet_id, week_start, week_label)
+    agent_sheets.update_dashboard_week(
+        spreadsheet_id, week_start, week_label, project_key=project_key
+    )
 
     week_entries = agent_sheets.read_week_entries(
         spreadsheet_id, week_start=week_start, week_end=week_end
@@ -893,11 +1095,11 @@ def _update_summary_from_sheet(
         print("  [JOURNAL WARNING] No Sheet entries found for current week.")
         return False
 
-    total_hours, hours_by_category = agent_sheets.get_dashboard_totals(spreadsheet_id)
-    if not hours_by_category:
-        hours_by_category = jm.compute_hours_by_category(week_entries)
+    total_hours, _hours_by_category = agent_sheets.get_dashboard_totals(spreadsheet_id)
     if not total_hours:
         total_hours = round(sum(entry.hours for entry in week_entries), 2)
+    hours_by_task = jm.compute_hours_by_task(week_entries)
+    hours_by_category = jm.compute_hours_by_category(week_entries)
 
     compiled = compile_weekly_summary(
         week_entries,
@@ -905,6 +1107,7 @@ def _update_summary_from_sheet(
         week_label,
         total_hours=total_hours,
         hours_by_category=hours_by_category,
+        hours_by_task=hours_by_task,
     )
     if not compiled:
         return False
@@ -913,7 +1116,11 @@ def _update_summary_from_sheet(
     if not replace_summary_section(document_id, summary_body, service=service):
         return False
     return sync_sheet_sections_into_doc(
-        document_id, spreadsheet_id, project_name, service=service
+        document_id,
+        spreadsheet_id,
+        project_name,
+        service=service,
+        project_key=project_key,
     )
 
 
@@ -940,9 +1147,11 @@ def refresh_weekly_summary(
                 error_message="No Detailed Activity Log spreadsheet found/created.",
             )
 
-        spreadsheet_id = agent_sheets.ensure_spreadsheet(project_name, spreadsheet_id)
+        spreadsheet_id = agent_sheets.ensure_spreadsheet(
+            project_name, spreadsheet_id, project_key=project_key
+        )
         summary_updated = _update_summary_from_sheet(
-            document_id, spreadsheet_id, project_name, service
+            document_id, spreadsheet_id, project_name, service, project_key=project_key
         )
         # Optional Apps Script webhook for native linked charts (if configured).
         agent_sheets.trigger_docs_refresh(document_id, spreadsheet_id, project_name)
@@ -964,6 +1173,7 @@ def process_journal_update(
     new_entries: list[jm.LogEntry],
     project_key: str = "",
     spreadsheet_id: str = "",
+    rate: int = 0,
 ) -> JournalUpdateResult:
     if not document_id:
         return JournalUpdateResult(success=False, error_message="Document ID is empty.")
@@ -987,9 +1197,33 @@ def process_journal_update(
                 error_message="No Detailed Activity Log spreadsheet found/created.",
             )
 
-        spreadsheet_id = agent_sheets.ensure_spreadsheet(project_name, spreadsheet_id)
-        agent_sheets.update_dashboard_week(spreadsheet_id, week_start, week_label)
-        agent_sheets.append_log_entries(spreadsheet_id, new_entries)
+        # First Slack entry: default project schedule if still blank.
+        if project_key:
+            try:
+                import firestore_store
+
+                firestore_store.ensure_project_schedule_on_first_log(
+                    project_key,
+                    entry_when=new_entries[0].timestamp,
+                )
+            except Exception as exc:
+                print(
+                    f"  [JOURNAL WARNING] Could not set project schedule defaults: {exc}",
+                    flush=True,
+                )
+
+        spreadsheet_id = agent_sheets.ensure_spreadsheet(
+            project_name, spreadsheet_id, project_key=project_key
+        )
+        agent_sheets.update_dashboard_week(
+            spreadsheet_id, week_start, week_label, project_key=project_key
+        )
+        agent_sheets.append_log_entries(
+            spreadsheet_id,
+            new_entries,
+            rate=rate,
+            project_key=project_key,
+        )
         log_appended = True
 
         if not initialize_document_structure(
@@ -1003,7 +1237,7 @@ def process_journal_update(
             )
 
         summary_updated = _update_summary_from_sheet(
-            document_id, spreadsheet_id, project_name, service
+            document_id, spreadsheet_id, project_name, service, project_key=project_key
         )
         if not summary_updated:
             print("  [JOURNAL WARNING] Sheet saved but Doc narrative/table sync failed.")

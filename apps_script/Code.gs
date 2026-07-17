@@ -69,29 +69,42 @@ function refreshDocFromSheet_(documentId, spreadsheetId, projectName) {
   var weekOf = dashboard.getRange('B2').getDisplayValue();
   var totalHours = dashboard.getRange('B3').getDisplayValue();
 
-  // Category | Actual Hours | Estimate starts at row 5 (header) / row 6 (data).
-  var categoryRows = dashboard.getRange('A6:C40').getDisplayValues()
-    .filter(function (row) {
-      return row[0] && String(row[0]).toLowerCase() !== 'category';
-    });
+  // Prefer Task Budget table if present; fall back to older Category table layout.
+  var dashValues = dashboard.getDataRange().getDisplayValues();
+  var taskHeaderRow = -1;
+  for (var r = 0; r < dashValues.length; r++) {
+    if (dashValues[r][0] === 'Task' && dashValues[r][1] === 'Hours') {
+      taskHeaderRow = r;
+    }
+  }
+  var budgetRows = [];
+  if (taskHeaderRow >= 0) {
+    for (var t = taskHeaderRow + 1; t < dashValues.length; t++) {
+      var trow = dashValues[t];
+      if (!trow[0] || String(trow[0]).toLowerCase() === 'task') break;
+      if (String(trow[0]).indexOf('Budget') >= 0) break;
+      budgetRows.push(trow);
+    }
+  }
 
   var hoursLines = [
     'Week of: ' + weekOf,
     'Week start: ' + weekStart,
     'Total Hours: ' + totalHours,
     '',
-    'Hours by Category:',
+    'Hours by Task:',
   ];
-  categoryRows.forEach(function (row) {
-    var estimate = row[2] ? String(row[2]) : '(enter in Sheet)';
+  budgetRows.forEach(function (row) {
+    var estimate = row[3] ? String(row[3]) : '(enter in Sheet)';
+    var completed = row[2] ? String(row[2]) : '0';
     hoursLines.push(row[0]);
-    hoursLines.push('Actual ' + row[1] + ' hrs | Estimate ' + estimate + ' hrs');
+    hoursLines.push('Actual ' + row[1] + ' hrs | Completed $' + completed + ' | Estimated $' + estimate);
     hoursLines.push('');
   });
-  if (categoryRows.length === 0) {
+  if (budgetRows.length === 0) {
     hoursLines.push('(none this week)');
   }
-  hoursLines.push('(Bar chart of Actual vs Estimate appears in the section below.)');
+  hoursLines.push('(Task budget progress chart appears in the section below.)');
 
   var activityValues = activity.getDataRange().getDisplayValues();
   var activityLines = ['Timestamp | User | Hours | Task | Category | Activity'];

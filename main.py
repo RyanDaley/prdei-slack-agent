@@ -1118,15 +1118,57 @@ def handle_logtime_submission(ack, body, client, view):
                     for entry in entries
                 ],
             )
+            print(
+                f"[FIRESTORE] Saved last_logtime for {user_id}: "
+                f"{len(entries)} entr(y/ies)",
+                flush=True,
+            )
         except Exception as exc:
             print(f"[SLACK WARNING] Could not save last logtime for {user_id}: {exc}", flush=True)
+
+    user_rate = firestore_store.DEFAULT_USER_RATE
+    if user_id:
+        try:
+            user_rec = firestore_store.get_user(user_id)
+            if user_rec:
+                user_rate = user_rec.rate
+            else:
+                # First logtime for an unknown user — create with default rate.
+                firestore_store.upsert_user(
+                    slack_user_id=user_id,
+                    display_name=user_name,
+                    rate=firestore_store.DEFAULT_USER_RATE,
+                )
+                user_rate = firestore_store.DEFAULT_USER_RATE
+        except Exception as exc:
+            print(f"[SLACK WARNING] Could not load user rate for {user_id}: {exc}", flush=True)
 
     total_hours = round(sum(entry.hours for entry in entries), 2)
     print(
         f"[SLACK SOCKET] Modal submitted by {user_name}: "
         f"{len(entries)} journal entries ({total_hours:g} hr), "
-        f"break={break_hours:g} hr"
+        f"break={break_hours:g} hr, rate={user_rate}"
     )
+
+    # Firestore first: every Slack work entry → time_logs + Task.completed
+    if entries and user_id:
+        try:
+            notes = firestore_store.apply_logtime_billing(
+                user_id=user_id, entries=entries
+            )
+            for note in notes:
+                print(f"[FIRESTORE] {note}", flush=True)
+            print(
+                f"[FIRESTORE] Permanent activity stored in time_logs + "
+                f"users/{user_id}/activities ({len(entries)} new row(s)). "
+                f"last_logtime.prefill_rows is form prefill only.",
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                f"[FIRESTORE WARNING] time_logs / Completed update failed: {exc}",
+                flush=True,
+            )
 
     results = []
     for project_key, project_entries in entries_by_project.items():
@@ -1152,6 +1194,7 @@ def handle_logtime_submission(ack, body, client, view):
             project_entries,
             project_key=project_key,
             spreadsheet_id=assets.spreadsheet_id,
+            rate=user_rate,
         )
         project_hours = round(sum(entry.hours for entry in project_entries), 2)
         if result.log_appended and result.summary_updated:

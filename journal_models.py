@@ -250,6 +250,14 @@ def compute_hours_by_category(entries: list[LogEntry]) -> dict[str, float]:
     return dict(sorted(totals.items()))
 
 
+def compute_hours_by_task(entries: list[LogEntry]) -> dict[str, float]:
+    totals: dict[str, float] = {}
+    for entry in entries:
+        label = entry.task_label or "(unspecified task)"
+        totals[label] = round(totals.get(label, 0.0) + entry.hours, 2)
+    return dict(sorted(totals.items()))
+
+
 def extract_active_detail_log_text(doc_text: str) -> str:
     """
     Return only the active detailed-activity text used for weekly totals.
@@ -310,16 +318,24 @@ def render_summary_body(
     total_hours: float,
     hours_by_category: dict[str, float],
     accomplishments_narrative: str,
+    hours_by_task: dict[str, float] | None = None,
 ) -> str:
     lines = [
         f"Total Hours: {total_hours:g}",
         "",
-        "Hours by Category:",
+        "Hours by Task:",
     ]
-    for category, hours in hours_by_category.items():
-        lines.append(category)
-        lines.append(f"Actual {hours:g} hrs")
-        lines.append("")
+    task_hours = hours_by_task if hours_by_task is not None else {}
+    if task_hours:
+        for task, hours in task_hours.items():
+            lines.append(task)
+            lines.append(f"Actual {hours:g} hrs")
+            lines.append("")
+    else:
+        for category, hours in hours_by_category.items():
+            lines.append(category)
+            lines.append(f"Actual {hours:g} hrs")
+            lines.append("")
 
     lines.extend(
         [
