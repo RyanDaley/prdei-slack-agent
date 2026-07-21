@@ -153,7 +153,12 @@ def _open_logtime_modal(client, trigger_id: str, channel_id: str, user_id: str):
 
     modal = build_logtime_modal(row_count=row_count, preserve_state=preserve_state)
     modal["private_metadata"] = json.dumps(
-        {"channel_id": channel_id, "user_id": user_id, "row_count": row_count}
+        _logtime_private_metadata(
+            channel_id=channel_id,
+            user_id=user_id,
+            row_count=row_count,
+            preserve_state=preserve_state,
+        )
     )
     client.views_open(trigger_id=trigger_id, view=modal)
 
@@ -708,20 +713,64 @@ def _parse_modal_submission(state_values: dict, user_name: str) -> tuple[list[jm
     return entries, errors, break_hours
 
 
+def _state_with_meta_fallback(state: dict | None, meta: dict | None) -> dict:
+    """
+    Overlay live Slack state on top of compact rows from private_metadata.
+
+    After views.update auto-selects a newly created project/task via
+    initial_option, Slack often omits that select from state.values until the
+    user opens the dropdown. Metadata keeps those selections so Task/Category +
+    still work in the same session.
+    """
+    merged = _preserve_from_snapshot((meta or {}).get("rows"))
+    for block_id, actions in (state or {}).items():
+        merged[block_id] = actions
+    return merged
+
+
+def _logtime_private_metadata(
+    *,
+    channel_id: str = "",
+    user_id: str = "",
+    row_count: int = MIN_ENTRY_ROWS,
+    preserve_state: dict | None = None,
+    base: dict | None = None,
+) -> dict:
+    """Build logtime modal private_metadata, including a compact rows snapshot."""
+    row_count = min(MAX_ENTRY_ROWS, max(MIN_ENTRY_ROWS, int(row_count or MIN_ENTRY_ROWS)))
+    meta = dict(base or {})
+    meta["channel_id"] = channel_id or meta.get("channel_id") or ""
+    meta["user_id"] = user_id or meta.get("user_id") or ""
+    meta["row_count"] = row_count
+    meta["rows"] = _snapshot_logtime_rows(preserve_state, row_count)
+    return _trim_parent_meta_for_slack(meta)
+
+
 def _rebuild_logtime_view(ack, body, client, *, force: bool = True) -> None:
     """Rebuild logtime modal from current state (cascading dropdowns / add entry)."""
     ack()
     view = body.get("view") or {}
-    state = _sanitize_task_selections(dict(view.get("state", {}).get("values", {}) or {}))
     try:
         meta = json.loads(view.get("private_metadata") or "{}")
     except Exception:
         meta = {}
+    state = _sanitize_task_selections(
+        _state_with_meta_fallback(
+            view.get("state", {}).get("values", {}) or {}, meta
+        )
+    )
     row_count = int(meta.get("row_count") or _row_count_from_view_state(state) or MIN_ENTRY_ROWS)
     row_count = min(MAX_ENTRY_ROWS, max(MIN_ENTRY_ROWS, row_count))
-    meta["row_count"] = row_count
     updated = build_logtime_modal(row_count=row_count, preserve_state=state)
-    updated["private_metadata"] = json.dumps(meta)
+    updated["private_metadata"] = json.dumps(
+        _logtime_private_metadata(
+            channel_id=meta.get("channel_id", ""),
+            user_id=meta.get("user_id", ""),
+            row_count=row_count,
+            preserve_state=state,
+            base=meta,
+        )
+    )
     try:
         client.views_update(
             view_id=view.get("id"),
@@ -739,7 +788,7 @@ def _parent_metadata_from_view(view: dict) -> dict:
     except Exception:
         meta = {}
     meta["parent_view_id"] = view.get("id", "")
-    # Do not store preserve_state — Slack private_metadata max is 3000 chars.
+    # Compact rows may be stored; full preserve_state is too large for Slack's 3000 cap.
     return meta
 
 def _build_create_named_modal(kind: str, parent_meta: dict) -> dict:
@@ -987,13 +1036,14 @@ def _enrich_create_parent_meta(
         root_meta.get("user_id") or parent_meta.get("user_id") or ""
     )
     parent_meta["row_index"] = int(row_index or 0)
+    merged_state = _state_with_meta_fallback(state, root_meta)
     row_count = int(
         root_meta.get("row_count")
-        or _row_count_from_view_state(state)
+        or _row_count_from_view_state(merged_state)
         or MIN_ENTRY_ROWS
     )
     parent_meta["row_count"] = min(MAX_ENTRY_ROWS, max(MIN_ENTRY_ROWS, row_count))
-    parent_meta["rows"] = _snapshot_logtime_rows(state, parent_meta["row_count"])
+    parent_meta["rows"] = _snapshot_logtime_rows(merged_state, parent_meta["row_count"])
     return parent_meta
 
 
@@ -1021,12 +1071,16 @@ def _refresh_parent_logtime(
         select_project_id=select_project_id,
     )
     updated = build_logtime_modal(row_count=row_count, preserve_state=preserve)
-    root_meta = {
-        "channel_id": parent_meta.get("channel_id", ""),
-        "user_id": parent_meta.get("user_id", ""),
-        "row_count": row_count,
-    }
-    updated["private_metadata"] = json.dumps(root_meta)
+    # Persist auto-selected project/task/category in private_metadata so the next
+    # "+" click can see them even when Slack omits initial_option from state.
+    updated["private_metadata"] = json.dumps(
+        _logtime_private_metadata(
+            channel_id=parent_meta.get("channel_id", ""),
+            user_id=parent_meta.get("user_id", ""),
+            row_count=row_count,
+            preserve_state=preserve,
+        )
+    )
     try:
         client.views_update(view_id=view_id, view=updated)
     except Exception as exc:
@@ -1167,15 +1221,27 @@ def handle_entry_duration_select(ack, body, client):
 def handle_add_entry_btn(ack, body, client):
     ack()
     view = body.get("view") or {}
-    state = _sanitize_task_selections(dict(view.get("state", {}).get("values", {}) or {}))
     try:
         meta = json.loads(view.get("private_metadata") or "{}")
     except Exception:
         meta = {}
+    state = _sanitize_task_selections(
+        _state_with_meta_fallback(
+            view.get("state", {}).get("values", {}) or {}, meta
+        )
+    )
     current = int(meta.get("row_count") or _row_count_from_view_state(state) or MIN_ENTRY_ROWS)
-    meta["row_count"] = min(MAX_ENTRY_ROWS, max(MIN_ENTRY_ROWS, current + 1))
-    updated = build_logtime_modal(row_count=meta["row_count"], preserve_state=state)
-    updated["private_metadata"] = json.dumps(meta)
+    row_count = min(MAX_ENTRY_ROWS, max(MIN_ENTRY_ROWS, current + 1))
+    updated = build_logtime_modal(row_count=row_count, preserve_state=state)
+    updated["private_metadata"] = json.dumps(
+        _logtime_private_metadata(
+            channel_id=meta.get("channel_id", ""),
+            user_id=meta.get("user_id", ""),
+            row_count=row_count,
+            preserve_state=state,
+            base=meta,
+        )
+    )
     try:
         client.views_update(
             view_id=view.get("id"),
@@ -1192,7 +1258,13 @@ def _push_create_modal(ack, body, client, kind: str):
     if not trigger_id:
         return
     view = body.get("view") or {}
-    state = view.get("state", {}).get("values", {}) or {}
+    try:
+        meta = json.loads(view.get("private_metadata") or "{}")
+    except Exception:
+        meta = {}
+    state = _state_with_meta_fallback(
+        view.get("state", {}).get("values", {}) or {}, meta
+    )
     actions = body.get("actions") or []
     try:
         row_index = int((actions[0] or {}).get("value") or 0)
@@ -1203,10 +1275,13 @@ def _push_create_modal(ack, body, client, kind: str):
     _enrich_create_parent_meta(
         parent_meta, view=view, state=state, row_index=row_index
     )
-    client.views_push(
-        trigger_id=trigger_id,
-        view=_build_create_named_modal(kind, parent_meta),
-    )
+    try:
+        client.views_push(
+            trigger_id=trigger_id,
+            view=_build_create_named_modal(kind, parent_meta),
+        )
+    except Exception as exc:
+        print(f"[SLACK WARNING] Could not push create_{kind} modal: {exc}", flush=True)
 
 
 @app.action("create_project_btn")
@@ -1226,7 +1301,13 @@ def handle_create_task_btn(ack, body, client):
         row_index = int((actions[0] or {}).get("value") or 0)
     except (TypeError, ValueError, IndexError):
         row_index = 0
-    state = view.get("state", {}).get("values", {}) or {}
+    try:
+        meta = json.loads(view.get("private_metadata") or "{}")
+    except Exception:
+        meta = {}
+    state = _state_with_meta_fallback(
+        view.get("state", {}).get("values", {}) or {}, meta
+    )
     project_id = _read_row_project(state, row_index)
     user_id = body.get("user", {}).get("id", "")
 
@@ -1251,10 +1332,13 @@ def handle_create_task_btn(ack, body, client):
         parent_meta["project_name"] = project.name if project else project_id
     except Exception:
         parent_meta["project_name"] = project_id
-    client.views_push(
-        trigger_id=trigger_id,
-        view=_build_create_named_modal("task", parent_meta),
-    )
+    try:
+        client.views_push(
+            trigger_id=trigger_id,
+            view=_build_create_named_modal("task", parent_meta),
+        )
+    except Exception as exc:
+        print(f"[SLACK WARNING] Could not push create_task modal: {exc}", flush=True)
 
 
 @app.action("create_category_btn")
@@ -1269,7 +1353,13 @@ def handle_create_category_btn(ack, body, client):
         row_index = int((actions[0] or {}).get("value") or 0)
     except (TypeError, ValueError, IndexError):
         row_index = 0
-    state = view.get("state", {}).get("values", {}) or {}
+    try:
+        meta = json.loads(view.get("private_metadata") or "{}")
+    except Exception:
+        meta = {}
+    state = _state_with_meta_fallback(
+        view.get("state", {}).get("values", {}) or {}, meta
+    )
     project_id = _read_row_project(state, row_index)
     task_id = _read_row_task(state, row_index, project_id)
     user_id = body.get("user", {}).get("id", "")
@@ -1296,10 +1386,13 @@ def handle_create_category_btn(ack, body, client):
         parent_meta["task_name"] = task.name if task else task_id
     except Exception:
         parent_meta["task_name"] = task_id
-    client.views_push(
-        trigger_id=trigger_id,
-        view=_build_create_named_modal("category", parent_meta),
-    )
+    try:
+        client.views_push(
+            trigger_id=trigger_id,
+            view=_build_create_named_modal("category", parent_meta),
+        )
+    except Exception as exc:
+        print(f"[SLACK WARNING] Could not push create_category modal: {exc}", flush=True)
 
 
 @app.view("create_task_modal")
@@ -1487,15 +1580,26 @@ def _slack_employee_identity(client, user_id: str) -> tuple[str, str]:
 @app.view("logtime_modal")
 def handle_logtime_submission(ack, body, client, view):
     user = body.get("user", {})
-    user_name = user.get("name") or user.get("username", "Unknown User")
+    slack_username = user.get("name") or user.get("username", "Unknown User")
     state_values = view.get("state", {}).get("values", {})
 
-    entries, errors, break_hours = _parse_modal_submission(state_values, user_name)
+    # Temporary label for validation; replaced with Firestore/Slack display name below
+    # so Activity Log matches seeded rows (display name) instead of Slack username.
+    entries, errors, break_hours = _parse_modal_submission(state_values, slack_username)
     if errors:
         ack(response_action="errors", errors=errors)
         return
 
     ack()
+
+    metadata = json.loads(view.get("private_metadata") or "{}")
+    channel_id = metadata.get("channel_id")
+    user_id = user.get("id") or metadata.get("user_id")
+    display_name, _last_name = (
+        _slack_employee_identity(client, user_id) if user_id else (slack_username, "Employee")
+    )
+    for entry in entries:
+        entry.user = display_name
 
     duration = (
         _hours_to_option_value(entries[0].hours) if entries else DEFAULT_ENTRY_DURATION
@@ -1504,10 +1608,6 @@ def handle_logtime_submission(ack, body, client, view):
     entries_by_project: dict[str, list[jm.LogEntry]] = defaultdict(list)
     for entry in entries:
         entries_by_project[entry.project_key].append(entry)
-
-    metadata = json.loads(view.get("private_metadata") or "{}")
-    channel_id = metadata.get("channel_id")
-    user_id = user.get("id") or metadata.get("user_id")
 
     if entries and user_id:
         try:
@@ -1543,7 +1643,7 @@ def handle_logtime_submission(ack, body, client, view):
                 # First logtime for an unknown user — create with default rate.
                 firestore_store.upsert_user(
                     slack_user_id=user_id,
-                    display_name=user_name,
+                    display_name=display_name,
                     rate=firestore_store.DEFAULT_USER_RATE,
                 )
                 user_rate = firestore_store.DEFAULT_USER_RATE
@@ -1552,7 +1652,7 @@ def handle_logtime_submission(ack, body, client, view):
 
     total_hours = round(sum(entry.hours for entry in entries), 2)
     print(
-        f"[SLACK SOCKET] Modal submitted by {user_name}: "
+        f"[SLACK SOCKET] Modal submitted by {display_name} ({slack_username}): "
         f"{len(entries)} journal entries ({total_hours:g} hr), "
         f"break={break_hours:g} hr, rate={user_rate}"
     )
@@ -1578,6 +1678,9 @@ def handle_logtime_submission(ack, body, client, view):
             )
 
     results = []
+    # Doc/chart sync is deferred until after timesheet so an OOM during chart
+    # embed cannot drop timesheet hours.
+    pending_doc_syncs: list[tuple[str, str, str, str, str]] = []
     for project_key, project_entries in entries_by_project.items():
         project_name = project_router.get_project_display_name(project_key)
         try:
@@ -1602,19 +1705,23 @@ def handle_logtime_submission(ack, body, client, view):
             project_key=project_key,
             spreadsheet_id=assets.spreadsheet_id,
             rate=user_rate,
+            sync_document=False,
         )
         project_hours = round(sum(entry.hours for entry in project_entries), 2)
-        if result.log_appended and result.summary_updated:
-            refresh_note = " Doc tables synced." if result.docs_refreshed else ""
+        if result.log_appended:
+            pending_doc_syncs.append(
+                (
+                    assets.document_id,
+                    project_name,
+                    result.spreadsheet_id or assets.spreadsheet_id,
+                    project_key,
+                    assets.document_title,
+                )
+            )
             results.append(
                 f"✅ *{project_name}* (Doc `{assets.document_title}`): "
-                f"logged {project_hours:g} hr(s) to Sheet "
-                f"and refreshed weekly narrative.{refresh_note}"
-            )
-        elif result.log_appended:
-            results.append(
-                f"⚠️ *{project_name}*: logged {project_hours:g} hr(s) to Sheet, "
-                "but Doc narrative refresh failed."
+                f"logged {project_hours:g} hr(s) to Sheet. "
+                "Doc/chart sync running in the background."
             )
         else:
             results.append(
@@ -1643,6 +1750,14 @@ def handle_logtime_submission(ack, body, client, view):
             results.append(
                 f"⚠️ Timesheet write failed: {ts_result.error_message or 'unknown error'}."
             )
+
+    for document_id, project_name, spreadsheet_id, project_key, _doc_title in pending_doc_syncs:
+        agent_journal.schedule_period_document_sync(
+            document_id,
+            project_name,
+            spreadsheet_id,
+            project_key=project_key,
+        )
 
     message = "\n".join(results) if results else "No entries were processed."
     if user_id:

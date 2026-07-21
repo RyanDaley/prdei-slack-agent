@@ -1057,6 +1057,23 @@ def add_time_log(
     )
 
 
+def _time_log_from_doc(doc) -> TimeLogRecord:
+    data = doc.to_dict() or {}
+    return TimeLogRecord(
+        id=doc.id,
+        project_key=str(data.get("project_key") or ""),
+        task=str(data.get("task") or ""),
+        category=str(data.get("category") or ""),
+        hours=float(data.get("hours") or 0),
+        user_id=str(data.get("user_id") or ""),
+        user_email=str(data.get("user_email") or ""),
+        logged_at=data.get("logged_at") or datetime.utcnow(),
+        task_id=str(data.get("task_id") or ""),
+        category_id=str(data.get("category_id") or ""),
+        activity=str(data.get("activity") or ""),
+    )
+
+
 def list_time_logs(
     *,
     user_id: str | None = None,
@@ -1064,33 +1081,49 @@ def list_time_logs(
     limit: int = 500,
 ) -> list[TimeLogRecord]:
     """List permanent time_logs (newest first). Optional user / project filters."""
+    limit_n = max(1, int(limit))
+    uid = (user_id or "").strip() or None
+    pk = (project_key or "").strip() or None
     query = get_db().collection(COL_TIME_LOGS)
-    if user_id:
-        query = query.where("user_id", "==", (user_id or "").strip())
-    if project_key:
-        query = query.where("project_key", "==", (project_key or "").strip())
-    query = query.order_by("logged_at", direction=firestore.Query.DESCENDING).limit(
-        max(1, int(limit))
-    )
-    out: list[TimeLogRecord] = []
-    for doc in query.stream():
-        data = doc.to_dict() or {}
-        out.append(
-            TimeLogRecord(
-                id=doc.id,
-                project_key=str(data.get("project_key") or ""),
-                task=str(data.get("task") or ""),
-                category=str(data.get("category") or ""),
-                hours=float(data.get("hours") or 0),
-                user_id=str(data.get("user_id") or ""),
-                user_email=str(data.get("user_email") or ""),
-                logged_at=data.get("logged_at") or datetime.utcnow(),
-                task_id=str(data.get("task_id") or ""),
-                category_id=str(data.get("category_id") or ""),
-                activity=str(data.get("activity") or ""),
-            )
+    if uid:
+        query = query.where(filter=firestore.FieldFilter("user_id", "==", uid))
+    if pk:
+        query = query.where(filter=firestore.FieldFilter("project_key", "==", pk))
+
+    def _stream(q) -> list[TimeLogRecord]:
+        return [_time_log_from_doc(doc) for doc in q.stream()]
+
+    # Equality + order_by needs a composite index. Prefer that path; if the
+    # index is missing, filter without order_by and sort in memory so Activity
+    # Log reseeding still works.
+    try:
+        return _stream(
+            query.order_by(
+                "logged_at", direction=firestore.Query.DESCENDING
+            ).limit(limit_n)
         )
-    return out
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "index" not in msg and "failed_precondition" not in msg:
+            raise
+        print(
+            f"[FIRESTORE WARNING] time_logs ordered query needs an index; "
+            f"falling back to in-memory sort: {exc}",
+            flush=True,
+        )
+        rows = _stream(query)
+
+        def _sort_key(rec: TimeLogRecord):
+            when = rec.logged_at
+            if not isinstance(when, datetime):
+                return 0.0
+            try:
+                return when.timestamp()
+            except Exception:
+                return float(when.toordinal())
+
+        rows.sort(key=_sort_key, reverse=True)
+        return rows[:limit_n]
 
 
 def list_user_entries(slack_user_id: str, *, limit: int = 500) -> list[TimeLogRecord]:

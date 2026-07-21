@@ -15,6 +15,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
@@ -43,6 +44,9 @@ SCOPES = [
 HOURS_START = "Hours Summary"
 CHART_START = "Category Chart"
 ACTIVITY_START = "Detailed Activity Log"
+# One stable chart asset per project folder (overwrite in place; never suffix by sheet id).
+CHART_PNG_FILENAME = "prdei-task-budget-chart.png"
+_LEGACY_CHART_PNG_PREFIX = "prdei-category-chart-"
 
 # Document Heading 1: 14 pt, bold, PRDEI blue
 HEADING1_RGB = (69, 176, 225)  # #45B0E1
@@ -574,35 +578,80 @@ def _folder_id_for_spreadsheet(spreadsheet_id: str) -> str:
     return parents[0] if parents else ""
 
 
+def _list_chart_pngs_in_folder(folder_id: str, drive=None) -> list[dict]:
+    """List chart PNGs in the project folder (canonical + legacy names)."""
+    drive = drive or _get_drive_service()
+    query = (
+        f"'{folder_id}' in parents "
+        f"and mimeType = 'image/png' "
+        "and trashed = false "
+        f"and (name = '{project_router._escape_drive_query(CHART_PNG_FILENAME)}' "
+        f"or name contains '{_LEGACY_CHART_PNG_PREFIX}')"
+    )
+    response = (
+        drive.files()
+        .list(
+            q=query,
+            spaces="drive",
+            fields="files(id, name, createdTime)",
+            pageSize=50,
+            orderBy="createdTime",
+            corpora="allDrives",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        )
+        .execute()
+    )
+    return list(response.get("files") or [])
+
+
 def _upload_temp_public_png(
     png_bytes: bytes,
     filename: str,
     folder_id: str = "",
 ) -> tuple[str, str]:
     """
-    Upload PNG to Drive with anyone-with-link read; return (file_id, public_uri).
+    Upsert the project chart PNG in Drive (anyone-with-link read).
 
-    If a file with the same name already exists in the folder, replace its
-    contents in place instead of creating a duplicate.
+    Always reuses/overwrites the canonical filename in the project folder so
+    recreating the Detailed Activity Log cannot spawn a new chart name.
+    Legacy prdei-category-chart-*.png copies are trashed.
     """
     drive = _get_drive_service()
     media = MediaIoBaseUpload(io.BytesIO(png_bytes), mimetype="image/png", resumable=False)
     file_id = ""
 
     if folder_id:
-        # Prefer oldest match; trash any other same-name copies.
-        matches = project_router._list_files_in_folder(
-            folder_id, filename, "image/png", drive=drive
-        )
-        if matches:
+        matches = _list_chart_pngs_in_folder(folder_id, drive=drive)
+        # Prefer an existing file already named with the canonical filename.
+        canonical = [f for f in matches if f.get("name") == filename]
+        if canonical:
+            file_id = canonical[0]["id"]
+        elif matches:
+            # Reuse oldest legacy file and rename it to the canonical name.
             file_id = matches[0]["id"]
-            for extra in matches[1:]:
+            try:
+                drive.files().update(
+                    fileId=file_id,
+                    body={"name": filename},
+                    supportsAllDrives=True,
+                    fields="id, name",
+                ).execute()
                 print(
-                    f"  [JOURNAL] Trashing duplicate chart PNG {extra['id']} "
-                    f"(keeping {file_id})",
+                    f"  [JOURNAL] Renamed legacy chart PNG to '{filename}' ({file_id})",
                     flush=True,
                 )
-                _trash_drive_file(extra["id"])
+            except Exception as exc:
+                print(f"  [JOURNAL WARNING] Could not rename legacy chart PNG: {exc}", flush=True)
+
+        for extra in matches:
+            if extra["id"] == file_id:
+                continue
+            print(
+                f"  [JOURNAL] Trashing extra chart PNG '{extra.get('name')}' ({extra['id']})",
+                flush=True,
+            )
+            _trash_drive_file(extra["id"])
 
     if file_id:
         drive.files().update(
@@ -611,7 +660,7 @@ def _upload_temp_public_png(
             supportsAllDrives=True,
             fields="id",
         ).execute()
-        print(f"  [JOURNAL] Replaced existing chart PNG '{filename}' ({file_id})", flush=True)
+        print(f"  [JOURNAL] Replaced chart PNG '{filename}' ({file_id})", flush=True)
     else:
         body: dict = {"name": filename, "mimeType": "image/png"}
         if folder_id:
@@ -627,7 +676,7 @@ def _upload_temp_public_png(
             .execute()
         )
         file_id = created["id"]
-        print(f"  [JOURNAL] Uploaded chart PNG '{filename}' ({file_id})", flush=True)
+        print(f"  [JOURNAL] Created chart PNG '{filename}' ({file_id})", flush=True)
 
     try:
         drive.permissions().create(
@@ -636,7 +685,6 @@ def _upload_temp_public_png(
             supportsAllDrives=True,
         ).execute()
     except Exception as exc:
-        # Permission may already exist from a prior upload.
         print(f"  [JOURNAL] Chart PNG share note: {exc}", flush=True)
 
     uri = f"https://drive.google.com/uc?export=download&id={file_id}"
@@ -846,12 +894,11 @@ def sync_category_chart_into_doc(
     )
 
     png_bytes = agent_sheets.render_task_progress_chart_png(task_rows)
-    file_id = ""
     try:
         folder_id = _folder_id_for_spreadsheet(spreadsheet_id)
-        file_id, uri = _upload_temp_public_png(
+        _file_id, uri = _upload_temp_public_png(
             png_bytes,
-            f"prdei-category-chart-{spreadsheet_id[:8]}.png",
+            CHART_PNG_FILENAME,
             folder_id=folder_id,
         )
 
@@ -915,9 +962,6 @@ def sync_category_chart_into_doc(
     except Exception as exc:
         print(f"  [JOURNAL ERROR] Chart image sync failed: {exc}")
         return False
-    finally:
-        if file_id:
-            _trash_drive_file(file_id)
 
 
 def sync_sheet_sections_into_doc(
@@ -1185,10 +1229,9 @@ def refresh_weekly_summary(
                 error_message="No Detailed Activity Log spreadsheet found/created.",
             )
 
-        spreadsheet_id = agent_sheets.ensure_spreadsheet(
+        spreadsheet_id, _seeded = agent_sheets.ensure_spreadsheet(
             project_name, spreadsheet_id, project_key=project_key
         )
-        # One Dashboard rebuild for /refreshjournal (ensure_spreadsheet no longer does this).
         agent_sheets.refresh_dashboard_tables(
             agent_sheets.get_sheets_service(),
             spreadsheet_id,
@@ -1212,6 +1255,97 @@ def refresh_weekly_summary(
         return JournalUpdateResult(success=False, error_message=str(exc))
 
 
+def sync_period_document(
+    document_id: str,
+    project_name: str,
+    spreadsheet_id: str,
+    project_key: str = "",
+) -> JournalUpdateResult:
+    """
+    Heavy Doc/chart work: period Doc structure, narrative tables, chart PNG embed.
+    Call after Activity Log (+ timesheet) so OOM here cannot drop logged hours.
+    """
+    if not document_id:
+        return JournalUpdateResult(success=False, error_message="Document ID is empty.")
+    if not spreadsheet_id:
+        return JournalUpdateResult(
+            success=False, error_message="Spreadsheet ID is empty."
+        )
+
+    try:
+        service = get_docs_service()
+        _, _, week_label = jm.get_current_week_range()
+        if not initialize_document_structure(
+            document_id, project_name, week_label, service=service
+        ):
+            return JournalUpdateResult(
+                success=False,
+                spreadsheet_id=spreadsheet_id,
+                error_message="Could not initialize document structure.",
+            )
+
+        summary_updated = _update_summary_from_sheet(
+            document_id, spreadsheet_id, project_name, service, project_key=project_key
+        )
+        if not summary_updated:
+            print(
+                "  [JOURNAL WARNING] Doc narrative/table sync failed.",
+                flush=True,
+            )
+
+        agent_sheets.trigger_docs_refresh(document_id, spreadsheet_id, project_name)
+        print(
+            f"  [JOURNAL] Doc/chart sync finished for `{project_key or project_name}` "
+            f"(summary_updated={summary_updated})",
+            flush=True,
+        )
+        return JournalUpdateResult(
+            success=summary_updated,
+            summary_updated=summary_updated,
+            docs_refreshed=summary_updated,
+            spreadsheet_id=spreadsheet_id,
+            error_message="" if summary_updated else "Could not refresh weekly summary.",
+        )
+    except Exception as exc:
+        print(f"  [JOURNAL ERROR] Doc/chart sync failed: {exc}", flush=True)
+        return JournalUpdateResult(success=False, error_message=str(exc))
+
+
+def schedule_period_document_sync(
+    document_id: str,
+    project_name: str,
+    spreadsheet_id: str,
+    project_key: str = "",
+) -> None:
+    """Run sync_period_document on a daemon thread (non-blocking)."""
+    label = project_key or project_name or "project"
+
+    def _run() -> None:
+        print(
+            f"  [JOURNAL] Background Doc/chart sync starting for `{label}`…",
+            flush=True,
+        )
+        try:
+            sync_period_document(
+                document_id,
+                project_name,
+                spreadsheet_id,
+                project_key=project_key,
+            )
+        except Exception as exc:
+            print(
+                f"  [JOURNAL WARNING] Background Doc/chart sync crashed for "
+                f"`{label}`: {exc}",
+                flush=True,
+            )
+
+    threading.Thread(
+        target=_run,
+        name=f"doc-sync-{label}",
+        daemon=True,
+    ).start()
+
+
 def process_journal_update(
     document_id: str,
     project_name: str,
@@ -1219,6 +1353,8 @@ def process_journal_update(
     project_key: str = "",
     spreadsheet_id: str = "",
     rate: int = 0,
+    *,
+    sync_document: bool = True,
 ) -> JournalUpdateResult:
     if not document_id:
         return JournalUpdateResult(success=False, error_message="Document ID is empty.")
@@ -1228,8 +1364,7 @@ def process_journal_update(
     hours_logged = round(sum(entry.hours for entry in new_entries), 2)
 
     try:
-        service = get_docs_service()
-        week_start, week_end, week_label = jm.get_current_week_range()
+        week_start, _, _week_label = jm.get_current_week_range()
 
         if not spreadsheet_id and project_key:
             assets = project_router.ensure_project_assets(project_key)
@@ -1257,50 +1392,62 @@ def process_journal_update(
                     flush=True,
                 )
 
-        spreadsheet_id = agent_sheets.ensure_spreadsheet(
+        spreadsheet_id, seeded = agent_sheets.ensure_spreadsheet(
             project_name, spreadsheet_id, project_key=project_key
         )
         agent_sheets.update_dashboard_week(
             spreadsheet_id, week_start, week_label, project_key=project_key
         )
-        agent_sheets.append_log_entries(
-            spreadsheet_id,
-            new_entries,
-            rate=rate,
-            project_key=project_key,
-        )
+        if seeded:
+            # Sheet was empty/new and already filled from Firestore time_logs
+            # (including this submission). Skip append to avoid doubling hours.
+            print(
+                "  [JOURNAL] ActivityLog seeded from Firestore; "
+                "skipping duplicate append for this submit.",
+                flush=True,
+            )
+        else:
+            agent_sheets.append_log_entries(
+                spreadsheet_id,
+                new_entries,
+                rate=rate,
+                project_key=project_key,
+            )
         log_appended = True
 
-        if not initialize_document_structure(
-            document_id, project_name, week_label, service=service
-        ):
+        if not sync_document:
+            print(
+                f"  [JOURNAL SUCCESS] Logged {hours_logged:g} hr(s) to Sheet "
+                f"{spreadsheet_id}; Doc/chart sync deferred.",
+                flush=True,
+            )
             return JournalUpdateResult(
-                success=False,
+                success=True,
                 log_appended=True,
+                summary_updated=False,
+                docs_refreshed=False,
+                hours_logged=hours_logged,
                 spreadsheet_id=spreadsheet_id,
-                error_message="Logged to Sheet but could not initialize document structure.",
             )
 
-        summary_updated = _update_summary_from_sheet(
-            document_id, spreadsheet_id, project_name, service, project_key=project_key
+        doc_result = sync_period_document(
+            document_id,
+            project_name,
+            spreadsheet_id,
+            project_key=project_key,
         )
-        if not summary_updated:
-            print("  [JOURNAL WARNING] Sheet saved but Doc narrative/table sync failed.")
-
-        # Optional extra step for native linked charts if webapp URL is configured.
-        agent_sheets.trigger_docs_refresh(document_id, spreadsheet_id, project_name)
-
         print(
             f"  [JOURNAL SUCCESS] Logged {hours_logged:g} hr(s) to Sheet {spreadsheet_id}; "
-            f"summary_updated={summary_updated}"
+            f"summary_updated={doc_result.summary_updated}"
         )
         return JournalUpdateResult(
             success=log_appended,
             log_appended=log_appended,
-            summary_updated=summary_updated,
-            docs_refreshed=summary_updated,
+            summary_updated=doc_result.summary_updated,
+            docs_refreshed=doc_result.docs_refreshed,
             hours_logged=hours_logged,
             spreadsheet_id=spreadsheet_id,
+            error_message=doc_result.error_message,
         )
 
     except HttpError as http_err:

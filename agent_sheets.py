@@ -1461,13 +1461,129 @@ def _ensure_activity_headers(sheets, spreadsheet_id: str) -> None:
     print("  [SHEETS] Updated ActivityLog headers to include Rate/Amount")
 
 
+def _format_log_timestamp(when: datetime) -> str:
+    tz = ZoneInfo(jm.JOURNAL_TIMEZONE)
+    local = when
+    if isinstance(local, datetime):
+        if local.tzinfo is None:
+            local = local.replace(tzinfo=tz)
+        else:
+            local = local.astimezone(tz)
+        return local.strftime("%Y-%m-%d %I:%M %p")
+    return str(when or "")
+
+
+def seed_activity_log_from_firestore(
+    spreadsheet_id: str,
+    project_key: str,
+    sheets=None,
+    *,
+    limit: int = 5000,
+) -> int:
+    """
+    Populate an empty ActivityLog from Firestore time_logs for this project.
+    Returns number of rows written. Safe to call only when the sheet has no
+    activity rows yet (e.g. newly recreated Detailed Activity Log).
+    """
+    project_key = (project_key or "").strip()
+    if not project_key or not spreadsheet_id:
+        return 0
+    sheets = sheets or get_sheets_service()
+
+    try:
+        logs = firestore_store.list_time_logs(project_key=project_key, limit=limit)
+    except Exception as exc:
+        print(
+            f"  [SHEETS WARNING] Could not list Firestore time_logs for "
+            f"`{project_key}`: {exc}",
+            flush=True,
+        )
+        return 0
+    if not logs:
+        print(
+            f"  [SHEETS] No Firestore time_logs to seed for `{project_key}`",
+            flush=True,
+        )
+        return 0
+
+    # list_time_logs is newest-first; ActivityLog should read oldest→newest.
+    logs = list(reversed(logs))
+
+    user_cache: dict[str, tuple[str, int]] = {}
+
+    def _user_display_and_rate(user_id: str) -> tuple[str, int]:
+        uid = (user_id or "").strip()
+        if uid in user_cache:
+            return user_cache[uid]
+        display = uid or "Unknown"
+        rate = firestore_store.DEFAULT_USER_RATE
+        try:
+            rec = firestore_store.get_user(uid) if uid else None
+            if rec:
+                display = rec.display_name or rec.email or uid or display
+                if rec.rate and rec.rate > 0:
+                    rate = int(rec.rate)
+        except Exception:
+            pass
+        user_cache[uid] = (display, rate)
+        return display, rate
+
+    rows: list[list] = []
+    for log in logs:
+        when = log.logged_at
+        if not isinstance(when, datetime):
+            when = datetime.now(ZoneInfo(jm.JOURNAL_TIMEZONE))
+        week_start, _, _ = jm.get_current_week_range(reference=when)
+        display, rate = _user_display_and_rate(log.user_id)
+        hours = float(log.hours or 0)
+        amount = int(round(hours * rate))
+        rows.append(
+            [
+                _format_log_timestamp(when),
+                display,
+                hours,
+                log.task or "",
+                log.category or "",
+                log.activity or "",
+                week_start.date().isoformat(),
+                rate,
+                amount,
+            ]
+        )
+
+    sheets_quota.execute_with_retry(
+        sheets.spreadsheets()
+        .values()
+        .update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{ACTIVITY_TAB}!A2",
+            valueInputOption="USER_ENTERED",
+            body={"values": rows},
+        ),
+        label="seed_activity_log",
+    )
+    refresh_dashboard_tables(
+        sheets, spreadsheet_id, project_key=project_key, autosize=False
+    )
+    print(
+        f"  [SHEETS] Seeded ActivityLog with {len(rows)} Firestore time_log(s) "
+        f"for `{project_key}`",
+        flush=True,
+    )
+    return len(rows)
+
+
 def ensure_spreadsheet(
     project_name: str,
     spreadsheet_id: str = "",
     project_key: str = "",
-) -> str:
+) -> tuple[str, bool]:
     """
     Ensure ActivityLog + Dashboard tabs/formulas/chart exist.
+
+    Returns (spreadsheet_id, seeded_from_firestore).
+    When a new/empty ActivityLog is initialized, historical time_logs for the
+    project are copied from Firestore so deleting the Sheet does not lose history.
     """
     sheets = get_sheets_service()
     if not spreadsheet_id:
@@ -1486,13 +1602,24 @@ def ensure_spreadsheet(
         .get("values")
         or []
     )
+    seeded = False
     if not header:
         _write_headers_and_dashboard(sheets, spreadsheet_id, project_key=project_key)
+        if project_key:
+            seeded = seed_activity_log_from_firestore(
+                spreadsheet_id, project_key, sheets=sheets
+            ) > 0
     else:
         # Headers only — do not rebuild the Dashboard here. Callers that write
         # ActivityLog should refresh once after the write (quota-sensitive).
         _ensure_activity_headers(sheets, spreadsheet_id)
-    return spreadsheet_id
+        if project_key:
+            activity_rows = _read_activity_rows(sheets, spreadsheet_id)
+            if not activity_rows:
+                seeded = seed_activity_log_from_firestore(
+                    spreadsheet_id, project_key, sheets=sheets
+                ) > 0
+    return spreadsheet_id, seeded
 
 
 def get_category_bar_chart_id(spreadsheet_id: str, sheets=None) -> int | None:
