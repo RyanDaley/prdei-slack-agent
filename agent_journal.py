@@ -1364,7 +1364,7 @@ def process_journal_update(
     hours_logged = round(sum(entry.hours for entry in new_entries), 2)
 
     try:
-        week_start, _, _week_label = jm.get_current_week_range()
+        week_start, _, week_label = jm.get_current_week_range()
 
         if not spreadsheet_id and project_key:
             assets = project_router.ensure_project_assets(project_key)

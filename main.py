@@ -4,12 +4,11 @@ import re
 import threading
 from collections import defaultdict
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
+from flask import Flask, Request, request
 from slack_bolt import App
-from slack_bolt.adapter.socket_mode import SocketModeHandler
+from slack_bolt.adapter.flask import SlackRequestHandler
 
 import agent_journal
 import agent_timesheets
@@ -20,7 +19,13 @@ import hourly_reminder
 import journal_models as jm
 import project_router
 
-app = App(token=os.environ.get("SLACK_BOT_TOKEN"))
+# HTTP mode (Cloud Run): Slack POSTs to /slack/events. Requires SLACK_SIGNING_SECRET.
+app = App(
+    token=os.environ.get("SLACK_BOT_TOKEN"),
+    signing_secret=os.environ.get("SLACK_SIGNING_SECRET"),
+)
+flask_app = Flask(__name__)
+_slack_handler = SlackRequestHandler(app)
 
 FALLBACK_PROJECT_OPTIONS = [
     {"text": {"type": "plain_text", "text": "Tahoe Backyard"}, "value": "tahoe_backyard"},
@@ -1770,71 +1775,76 @@ def handle_logtime_submission(ack, body, client, view):
             print(f"[SLACK WARNING] Could not send confirmation message: {exc}")
 
 
-class HealthAndPickerServer(BaseHTTPRequestHandler):
-    def _maybe_remember_public_url(self):
-        """Learn Cloud Run public URL from inbound request Host header."""
-        if drive_picker.public_base_url():
-            return
-        host = (self.headers.get("Host") or "").strip()
-        if not host or host.startswith("localhost") or host.startswith("127."):
-            return
-        scheme = (
-            "https"
-            if "run.app" in host or self.headers.get("X-Forwarded-Proto") == "https"
-            else "http"
-        )
-        os.environ["SERVICE_PUBLIC_URL"] = f"{scheme}://{host}"
-        print(f"[PICKER] Learned SERVICE_PUBLIC_URL={os.environ['SERVICE_PUBLIC_URL']}", flush=True)
-
-    def do_GET(self):
-        self._maybe_remember_public_url()
-        parsed = urlparse(self.path)
-        if parsed.path.startswith("/drive-picker/"):
-            token = parsed.path.split("/drive-picker/", 1)[1].strip("/")
-            status, content_type, body = drive_picker.render_picker_page(token)
-            payload = body.encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-type", content_type)
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-            return
-
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-    def do_POST(self):
-        self._maybe_remember_public_url()
-        parsed = urlparse(self.path)
-        if parsed.path.startswith("/drive-picker/"):
-            token = parsed.path.split("/drive-picker/", 1)[1].strip("/")
-            length = int(self.headers.get("Content-Length", "0") or 0)
-            raw = self.rfile.read(length) if length else b""
-            status, content_type, body = drive_picker.handle_picker_post(
-                token, raw, self.headers.get("Content-Type", "")
-            )
-            payload = body.encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-type", content_type)
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-            return
-
-        self.send_response(404)
-        self.end_headers()
-
-    def log_message(self, format, *args):
+def _maybe_remember_public_url_from_request(req: Request) -> None:
+    """Learn Cloud Run public URL from inbound request Host header."""
+    if drive_picker.public_base_url():
         return
+    host = (req.headers.get("Host") or "").strip()
+    if not host or host.startswith("localhost") or host.startswith("127."):
+        return
+    scheme = (
+        "https"
+        if "run.app" in host or req.headers.get("X-Forwarded-Proto") == "https"
+        else "http"
+    )
+    os.environ["SERVICE_PUBLIC_URL"] = f"{scheme}://{host}"
+    print(
+        f"[PICKER] Learned SERVICE_PUBLIC_URL={os.environ['SERVICE_PUBLIC_URL']}",
+        flush=True,
+    )
 
 
-def run_health_server():
+@flask_app.before_request
+def _remember_public_url():
+    _maybe_remember_public_url_from_request(request)
+
+
+@flask_app.route("/slack/events", methods=["POST"])
+def slack_events():
+    """Slack Events, slash commands, and interactivity (HTTP mode)."""
+    return _slack_handler.handle(request)
+
+
+@flask_app.route("/", methods=["POST"])
+def slack_events_root_fallback():
+    """
+    Accept Slack POSTs at / as well as /slack/events.
+    Slash Commands often default to the service root URL; without this they get 405.
+    Prefer configuring Request URLs to /slack/events in api.slack.com.
+    """
+    return _slack_handler.handle(request)
+
+
+@flask_app.route("/health", methods=["GET"])
+@flask_app.route("/", methods=["GET"])
+def health():
+    return ("OK", 200, {"Content-Type": "text/plain"})
+
+
+@flask_app.route("/drive-picker/<path:token>", methods=["GET", "POST"])
+def drive_picker_route(token: str):
+    token = (token or "").strip().strip("/")
+    if request.method == "GET":
+        status, content_type, body = drive_picker.render_picker_page(token)
+    else:
+        status, content_type, body = drive_picker.handle_picker_post(
+            token,
+            request.get_data() or b"",
+            request.headers.get("Content-Type", ""),
+        )
+    return (body, status, {"Content-Type": content_type})
+
+
+def run_http_server():
     port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthAndPickerServer)
-    print(f"Health + Drive picker server listening on port {port}...")
-    server.serve_forever()
+    print(
+        f"HTTP server listening on port {port} "
+        f"(Slack /slack/events, health, drive-picker)...",
+        flush=True,
+    )
+    # Cloud Run: bind all interfaces. Threaded so Bolt can ack quickly while
+    # journal/Sheet work continues.
+    flask_app.run(host="0.0.0.0", port=port, threaded=True)
 
 
 if __name__ == "__main__":
@@ -1843,14 +1853,22 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"[FIRESTORE] Seed skipped / failed (env fallbacks still active): {exc}", flush=True)
 
-    health_thread = threading.Thread(target=run_health_server, daemon=True)
-    health_thread.start()
+    if not os.environ.get("SLACK_BOT_TOKEN"):
+        print("[CRITICAL] SLACK_BOT_TOKEN is missing.", flush=True)
+    if not os.environ.get("SLACK_SIGNING_SECRET"):
+        print(
+            "[CRITICAL] SLACK_SIGNING_SECRET is missing. "
+            "Copy Basic Information → Signing Secret from api.slack.com, "
+            "set it in env.yaml / Cloud Run, and point Event Subscriptions, "
+            "Interactivity, and Slash Commands at "
+            "https://<service-url>/slack/events",
+            flush=True,
+        )
 
-    app_token = os.environ.get("SLACK_APP_TOKEN")
-    if not app_token:
-        print("[CRITICAL] SLACK_APP_TOKEN is missing. Outbound socket connection cannot start.")
-    else:
-        hourly_reminder.start_hourly_reminder_thread(app.client)
-        print("Bolt app is running in Socket Mode! Listening for Slack events...")
-        handler = SocketModeHandler(app, app_token)
-        handler.start()
+    hourly_reminder.start_hourly_reminder_thread(app.client)
+    print(
+        "Bolt app running in HTTP mode (no Socket Mode). "
+        "Configure Slack Request URLs → /slack/events",
+        flush=True,
+    )
+    run_http_server()
