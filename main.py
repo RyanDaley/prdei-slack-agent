@@ -3,7 +3,7 @@ import os
 import re
 import threading
 from collections import defaultdict
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from flask import Flask, Request, request
@@ -82,6 +82,9 @@ DEFAULT_ENTRY_DURATION = "1.0"
 MIN_ENTRY_ROWS = 1
 MAX_ENTRY_ROWS = 12
 
+WORK_DATE_BLOCK_ID = "work_date_block"
+WORK_DATE_ACTION_ID = "work_date_select"
+
 
 def _option(text: str, value: str) -> dict:
     return {"text": {"type": "plain_text", "text": text[:75]}, "value": value}
@@ -140,6 +143,90 @@ def _create_plus_button(action_id: str, value: str, accessibility_label: str) ->
         "value": value,
         "accessibility_label": accessibility_label[:75],
     }
+
+
+def _today_local() -> date:
+    return datetime.now(ZoneInfo(jm.JOURNAL_TIMEZONE)).date()
+
+
+def _timesheet_week_sunday(reference: date | None = None) -> date:
+    """Sunday that starts the current Sun–Sat timesheet week."""
+    today = reference or _today_local()
+    saturday = project_router.this_saturday(today)
+    return saturday - timedelta(days=6)
+
+
+def _work_date_options(*, today: date | None = None) -> list[dict]:
+    """
+    Days in the current timesheet week up through today (no future days).
+    Option text: 'Monday 07/28/2026'; value: YYYY-MM-DD.
+    """
+    today = today or _today_local()
+    sunday = _timesheet_week_sunday(today)
+    options: list[dict] = []
+    for offset in range(7):
+        day = sunday + timedelta(days=offset)
+        if day > today:
+            break
+        label = f"{day.strftime('%A')} {day.strftime('%m/%d/%Y')}"
+        options.append(_option(label, day.isoformat()))
+    if not options:
+        label = f"{today.strftime('%A')} {today.strftime('%m/%d/%Y')}"
+        options.append(_option(label, today.isoformat()))
+    return options
+
+
+def _read_work_date(state: dict | None) -> str | None:
+    return _state_value(
+        state, WORK_DATE_BLOCK_ID, WORK_DATE_ACTION_ID, "selected_option"
+    )
+
+
+def _set_work_date_preserve(state: dict, work_date_iso: str) -> None:
+    iso = (work_date_iso or "").strip()
+    if not iso:
+        return
+    state[WORK_DATE_BLOCK_ID] = {
+        WORK_DATE_ACTION_ID: {"selected_option": {"value": iso}}
+    }
+
+
+def _work_date_header_block(preserve_state: dict | None = None) -> dict:
+    """Section: 'Enter time for:' + day/date dropdown (right accessory)."""
+    options = _work_date_options()
+    today_iso = _today_local().isoformat()
+    saved = _read_work_date(preserve_state) or today_iso
+    matched = next((opt for opt in options if opt["value"] == saved), None)
+    if matched is None:
+        matched = next((opt for opt in options if opt["value"] == today_iso), options[-1])
+    return {
+        "type": "section",
+        "block_id": WORK_DATE_BLOCK_ID,
+        "text": {"type": "mrkdwn", "text": "*Enter time for:*"},
+        "accessory": {
+            "type": "static_select",
+            "action_id": WORK_DATE_ACTION_ID,
+            "options": options,
+            "initial_option": matched,
+        },
+    }
+
+
+def _entry_timestamp_for_work_date(work_date_iso: str | None) -> datetime:
+    """
+    Build a timezone-aware timestamp on the selected work date using the
+    current local clock time (so Activity Log / timesheet land on that day).
+    """
+    tz = ZoneInfo(jm.JOURNAL_TIMEZONE)
+    now = datetime.now(tz)
+    iso = (work_date_iso or "").strip()
+    if not iso:
+        return now
+    try:
+        work_day = date.fromisoformat(iso)
+    except ValueError:
+        return now
+    return datetime.combine(work_day, now.timetz())
 
 
 def _open_logtime_modal(client, trigger_id: str, channel_id: str, user_id: str):
@@ -583,21 +670,7 @@ def build_logtime_modal(
 ) -> dict:
     row_count = min(MAX_ENTRY_ROWS, max(MIN_ENTRY_ROWS, int(row_count or MIN_ENTRY_ROWS)))
 
-    blocks = [
-        {
-            "type": "context",
-            "elements": [
-                {
-                    "type": "mrkdwn",
-                    "text": (
-                        "Use *+* next to Project / Task / Category to create a new one. "
-                        "Changing Project refreshes Tasks; changing Task refreshes Categories. "
-                        "Category is optional."
-                    ),
-                }
-            ],
-        },
-    ]
+    blocks = [_work_date_header_block(preserve_state)]
 
     for row_index in range(row_count):
         blocks.extend(_entry_row_blocks(row_index, preserve_state))
@@ -649,7 +722,8 @@ def _parse_modal_submission(state_values: dict, user_name: str) -> tuple[list[jm
     """
     errors = {}
     row_count = _row_count_from_view_state(state_values)
-    now = datetime.now(ZoneInfo(jm.JOURNAL_TIMEZONE))
+    work_date_iso = _read_work_date(state_values)
+    entry_when = _entry_timestamp_for_work_date(work_date_iso)
     entries = []
     break_hours = 0.0
 
@@ -702,7 +776,7 @@ def _parse_modal_submission(state_values: dict, user_name: str) -> tuple[list[jm
 
         entries.append(
             jm.LogEntry(
-                timestamp=now,
+                timestamp=entry_when,
                 user=user_name,
                 hours=hours,
                 task=task_key,
@@ -728,6 +802,9 @@ def _state_with_meta_fallback(state: dict | None, meta: dict | None) -> dict:
     still work in the same session.
     """
     merged = _preserve_from_snapshot((meta or {}).get("rows"))
+    work_date = (meta or {}).get("work_date")
+    if work_date:
+        _set_work_date_preserve(merged, str(work_date))
     for block_id, actions in (state or {}).items():
         merged[block_id] = actions
     return merged
@@ -748,6 +825,8 @@ def _logtime_private_metadata(
     meta["user_id"] = user_id or meta.get("user_id") or ""
     meta["row_count"] = row_count
     meta["rows"] = _snapshot_logtime_rows(preserve_state, row_count)
+    work_date = _read_work_date(preserve_state) or meta.get("work_date") or _today_local().isoformat()
+    meta["work_date"] = work_date
     return _trim_parent_meta_for_slack(meta)
 
 
@@ -1049,6 +1128,11 @@ def _enrich_create_parent_meta(
     )
     parent_meta["row_count"] = min(MAX_ENTRY_ROWS, max(MIN_ENTRY_ROWS, row_count))
     parent_meta["rows"] = _snapshot_logtime_rows(merged_state, parent_meta["row_count"])
+    parent_meta["work_date"] = (
+        _read_work_date(merged_state)
+        or root_meta.get("work_date")
+        or _today_local().isoformat()
+    )
     return parent_meta
 
 
@@ -1066,6 +1150,8 @@ def _refresh_parent_logtime(
     row_count = int(parent_meta.get("row_count") or MIN_ENTRY_ROWS)
     row_count = min(MAX_ENTRY_ROWS, max(MIN_ENTRY_ROWS, row_count))
     preserve = _preserve_from_snapshot(parent_meta.get("rows"))
+    work_date = parent_meta.get("work_date") or _today_local().isoformat()
+    _set_work_date_preserve(preserve, str(work_date))
     _apply_created_selection(
         preserve,
         row_index=int(parent_meta.get("row_index") or 0),
@@ -1084,6 +1170,7 @@ def _refresh_parent_logtime(
             user_id=parent_meta.get("user_id", ""),
             row_count=row_count,
             preserve_state=preserve,
+            base={"work_date": work_date},
         )
     )
     try:
@@ -1214,6 +1301,11 @@ def handle_task_select(ack, body, client):
 
 @app.action("category_select")
 def handle_category_select(ack, body, client):
+    ack()
+
+
+@app.action(WORK_DATE_ACTION_ID)
+def handle_work_date_select(ack, body, client):
     ack()
 
 
