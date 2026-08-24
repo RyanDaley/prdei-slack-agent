@@ -1,5 +1,5 @@
 """
-Shared data models and helpers for the weekly project journal compiler.
+Shared data models and helpers for the project journal compiler.
 """
 
 from __future__ import annotations
@@ -12,7 +12,8 @@ from zoneinfo import ZoneInfo
 
 JOURNAL_TIMEZONE = os.environ.get("JOURNAL_TIMEZONE", "America/Los_Angeles")
 
-SUMMARY_HEADING = "Weekly Summary"
+SUMMARY_HEADING = "Monthly Summary"
+LEGACY_SUMMARY_HEADING = "Weekly Summary"
 DETAIL_LOG_HEADING = "Detailed Activity Log"
 LEGACY_HEADING = "--- LEGACY ENTRIES (ARCHIVED) ---"
 
@@ -234,6 +235,45 @@ def format_week_label(week_start: date, week_end: date) -> str:
     )
 
 
+def get_current_month_range(
+    reference: Optional[datetime] = None,
+) -> tuple[datetime, datetime, str]:
+    tz = ZoneInfo(JOURNAL_TIMEZONE)
+    now = reference or datetime.now(tz)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=tz)
+
+    first = now.date().replace(day=1)
+    if first.month == 12:
+        last = date(first.year + 1, 1, 1) - timedelta(days=1)
+    else:
+        last = date(first.year, first.month + 1, 1) - timedelta(days=1)
+    month_start = datetime.combine(first, time.min, tzinfo=tz)
+    month_end = datetime.combine(last, time.max, tzinfo=tz)
+    month_label = format_month_label(first)
+    return month_start, month_end, month_label
+
+
+def format_month_label(month_start: date) -> str:
+    return month_start.strftime("%B %Y")
+
+
+def filter_entries_for_month(
+    entries: list[LogEntry],
+    month_start: datetime,
+    month_end: datetime,
+) -> list[LogEntry]:
+    tz = ZoneInfo(JOURNAL_TIMEZONE)
+    filtered = []
+    for entry in entries:
+        ts = entry.timestamp
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=tz)
+        if month_start <= ts <= month_end:
+            filtered.append(entry)
+    return sorted(filtered, key=lambda e: e.timestamp)
+
+
 def filter_entries_for_week(
     entries: list[LogEntry],
     week_start: datetime,
@@ -268,7 +308,7 @@ def compute_hours_by_task(entries: list[LogEntry]) -> dict[str, float]:
 
 def extract_active_detail_log_text(doc_text: str) -> str:
     """
-    Return only the active detailed-activity text used for weekly totals.
+    Return only the active detailed-activity text used for period totals.
 
     Ignores archived legacy body content, while still including:
     - entries between the detail heading and the legacy heading, and
@@ -312,7 +352,7 @@ def build_fallback_summary(entries: list["LogEntry"]) -> dict:
             f"{entry.activity}"
         )
     narrative = (
-        "Weekly activity summary compiled from logged entries:\n\n"
+        "Monthly activity summary compiled from logged entries:\n\n"
         + "\n".join(lines)
     )
     return {

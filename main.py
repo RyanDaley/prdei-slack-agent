@@ -1199,18 +1199,16 @@ def handle_refresh_journal(ack, body, client):
     assets = project_router.ensure_project_assets(project_key)
     project_name = project_router.get_project_display_name(project_key)
     if not assets:
-        client.chat_postEphemeral(
-            channel=body["channel_id"],
-            user=user_id,
-            text=(
-                f"No Drive folder mapped for `{project_key}`. "
-                "Set the project's `drive_folder_url` in Firestore "
-                "(or PROJECT_FOLDER_* / PROJECT_DOC_MAP as fallback)."
-            ),
+        _post_missing_folder_help(
+            client,
+            channel_id=body["channel_id"],
+            user_id=user_id,
+            project_key=project_key,
+            project_name=project_name,
         )
         return
 
-    result = agent_journal.refresh_weekly_summary(
+    result = agent_journal.refresh_monthly_summary(
         assets.document_id,
         project_name,
         project_key=project_key,
@@ -1219,7 +1217,7 @@ def handle_refresh_journal(ack, body, client):
     if result.summary_updated:
         refresh_note = " Doc tables refreshed." if result.docs_refreshed else ""
         sheet_note = f" Sheet `{result.spreadsheet_id}`." if result.spreadsheet_id else ""
-        text = f"✅ Refreshed weekly summary for *{project_name}*.{sheet_note}{refresh_note}"
+        text = f"✅ Refreshed monthly summary for *{project_name}*.{sheet_note}{refresh_note}"
     else:
         text = f"❌ Could not refresh summary for *{project_name}*: {result.error_message or 'unknown error'}"
 
@@ -1643,6 +1641,61 @@ def handle_open_drive_picker_link(ack):
     ack()
 
 
+def _fresh_drive_picker_link(
+    project_key: str, project_name: str, user_id: str
+) -> str:
+    """Issue a new 15-minute Link Drive folder URL for an existing project."""
+    token = drive_picker.create_picker_token(project_key, project_name, user_id or "")
+    return drive_picker.picker_url(token)
+
+
+def _post_missing_folder_help(
+    client,
+    *,
+    channel_id: str,
+    user_id: str,
+    project_key: str,
+    project_name: str,
+    preface: str = "",
+) -> None:
+    """Ephemeral with a Choose Drive folder button when drive_folder_url is unset."""
+    link = _fresh_drive_picker_link(project_key, project_name, user_id)
+    text = (
+        (preface + "\n" if preface else "")
+        + f"No Drive folder mapped for *{project_name}* (`{project_key}`). "
+        "Use the button below to link a folder (expires in 15 minutes), then log time again."
+    )
+    kwargs: dict = {"channel": channel_id, "user": user_id, "text": text}
+    if link.startswith("http"):
+        kwargs["blocks"] = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "Choose Drive folder"},
+                        "url": link,
+                        "action_id": "open_drive_picker_link",
+                    }
+                ],
+            },
+            {
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": f"Or open: `{link}`"}],
+            },
+        ]
+    else:
+        kwargs["text"] = (
+            text
+            + f"\nSet `SERVICE_PUBLIC_URL` on Cloud Run, then try again. Path: `{link}`"
+        )
+    try:
+        client.chat_postEphemeral(**kwargs)
+    except Exception:
+        client.chat_postMessage(channel=user_id, text=kwargs["text"])
+
+
 def _slack_employee_identity(client, user_id: str) -> tuple[str, str]:
     """
     Return (display_name, last_name). Prefer Firestore User.display_name.
@@ -1788,11 +1841,21 @@ def handle_logtime_submission(ack, body, client, view):
             )
             continue
         if not assets:
-            results.append(
-                f"⚠️ No Drive folder mapped for key `{project_key}` "
-                f"(display '{project_name}'). "
-                "Set `drive_folder_url` in Firestore (or PROJECT_FOLDER_* fallback)."
-            )
+            if user_id and channel_id:
+                _post_missing_folder_help(
+                    client,
+                    channel_id=channel_id,
+                    user_id=user_id,
+                    project_key=project_key,
+                    project_name=project_name,
+                    preface="Time was not written for this project yet.",
+                )
+            else:
+                results.append(
+                    f"⚠️ No Drive folder mapped for key `{project_key}` "
+                    f"(display '{project_name}'). "
+                    "Set `drive_folder_url` in Firestore (or PROJECT_FOLDER_* fallback)."
+                )
             continue
 
         result = agent_journal.process_journal_update(

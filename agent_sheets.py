@@ -3,8 +3,8 @@ Google Sheets integration for the project activity log.
 
 Firestore is the source of truth for logged activity (time_logs) and task
 Completed $ / Avg Weekly Spend. Sheets are a working view:
-  - ActivityLog rows (written from Slack for the weekly narrative/chart)
-  - Dashboard: week rollups + PM-edited Estimated $ / project dates
+  - ActivityLog rows (written from Slack for the monthly narrative/chart)
+  - Dashboard: month rollups + PM-edited Estimated $ / project dates
   - Category/Task Budget Completed $ are SUMIF(S) from ActivityLog
     (task total = sum of its categories + uncategorized logs)
   - Avg Weekly Spend is filled from Firestore Completed $
@@ -15,7 +15,7 @@ Per-project sheets live in the project Drive folder and are named
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import google.auth
@@ -208,7 +208,7 @@ def _write_headers_and_dashboard(
     refresh_dashboard_tables(sheets, spreadsheet_id, project_key=project_key)
 
 
-def _read_week_start(sheets, spreadsheet_id: str) -> str:
+def _read_period_start(sheets, spreadsheet_id: str) -> str:
     result = (
         sheets.spreadsheets()
         .values()
@@ -218,8 +218,40 @@ def _read_week_start(sheets, spreadsheet_id: str) -> str:
     values = result.get("values") or []
     if values and values[0]:
         return str(values[0][0]).strip()
-    week_start, _, _ = jm.get_current_week_range()
-    return week_start.date().isoformat()
+    month_start, _, _ = jm.get_current_month_range()
+    return month_start.date().isoformat()
+
+
+def _read_week_start(sheets, spreadsheet_id: str) -> str:
+    """Backward-compatible alias for dashboard period start (month)."""
+    return _read_period_start(sheets, spreadsheet_id)
+
+
+def _month_bounds_from_start(month_start: date) -> tuple[date, date]:
+    first = month_start.replace(day=1)
+    if first.month == 12:
+        last = date(first.year + 1, 1, 1) - timedelta(days=1)
+    else:
+        last = date(first.year, first.month + 1, 1) - timedelta(days=1)
+    return first, last
+
+
+def _parse_activity_row_date(row: list) -> date | None:
+    padded = list(row) + [""] * 9
+    raw = str(padded[0] or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d %I:%M %p").date()
+    except (TypeError, ValueError):
+        return None
+
+
+def _activity_row_in_month(row: list, month_start: date, month_end: date) -> bool:
+    row_date = _parse_activity_row_date(row)
+    if row_date is not None:
+        return month_start <= row_date <= month_end
+    return False
 
 
 def _read_activity_rows(sheets, spreadsheet_id: str) -> list[list]:
@@ -407,8 +439,8 @@ def _refresh_dashboard_tables_impl(
     Rebuild Dashboard:
       - Week header + Total Hours / Total Completed ($)
       - Project Start Date / Estimated End Date (Sheet edit → Firestore)
-      - Employee × Task × Category hours (and Completed $) for the week
-      - Category budget: Hours | Completed ($) | Estimated ($)  (week-scoped)
+      - Employee × Task × Category hours (and Completed $) for the month
+      - Category budget: Hours | Completed ($) | Estimated ($)
       - Task budget: Hours | Completed ($) from Firestore | Estimated ($)
         (PM edit) | Remaining | Avg Weekly Spend (from Firestore completed)
 
@@ -416,10 +448,16 @@ def _refresh_dashboard_tables_impl(
     activity source of truth; this refresh reads task money fields from FS.
     """
     project_key = _resolve_project_key(sheets, spreadsheet_id, project_key)
-    week_start = _read_week_start(sheets, spreadsheet_id)
-    week_label = ""
+    period_start_str = _read_period_start(sheets, spreadsheet_id)
     try:
-        wl = (
+        period_anchor = date.fromisoformat(period_start_str)
+    except ValueError:
+        period_anchor = jm.get_current_month_range()[0].date()
+    month_start_date, month_end_date = _month_bounds_from_start(period_anchor)
+    month_start = month_start_date.isoformat()
+    month_label = ""
+    try:
+        ml = (
             sheets.spreadsheets()
             .values()
             .get(spreadsheetId=spreadsheet_id, range=f"{DASHBOARD_TAB}!B2")
@@ -427,10 +465,12 @@ def _refresh_dashboard_tables_impl(
             .get("values")
             or []
         )
-        if wl and wl[0]:
-            week_label = str(wl[0][0])
+        if ml and ml[0]:
+            month_label = str(ml[0][0])
     except Exception:
-        week_label = ""
+        month_label = ""
+    if not month_label:
+        month_label = jm.format_month_label(month_start_date)
 
     # --- Capture PM-typed values BEFORE clearing the Dashboard ---
     sheet_start, sheet_end = _read_project_schedule_from_sheet(sheets, spreadsheet_id)
@@ -516,12 +556,14 @@ def _refresh_dashboard_tables_impl(
         except Exception as exc:
             print(f"  [SHEETS WARNING] Sheet→Firestore estimate sync failed: {exc}", flush=True)
 
-    # Aggregate employee × task × category for this week (display only)
+    # Aggregate employee × task × category for this month (display only)
     emp_agg: dict[tuple[str, str, str], list[float]] = {}
     seen_tasks: set[str] = set()
+    month_total_hours = 0.0
+    month_total_completed = 0.0
     for row in activity:
         padded = list(row) + [""] * (9 - len(row))
-        user, hours_raw, task, category, _act, row_week = (
+        user, hours_raw, task, category, _act, _row_week = (
             padded[1],
             padded[2],
             padded[3],
@@ -532,7 +574,7 @@ def _refresh_dashboard_tables_impl(
         task_name = str(task).strip()
         if task_name:
             seen_tasks.add(task_name)
-        if str(row_week).strip() != week_start:
+        if not _activity_row_in_month(row, month_start_date, month_end_date):
             continue
         try:
             hours = float(hours_raw or 0)
@@ -548,6 +590,8 @@ def _refresh_dashboard_tables_impl(
             except (TypeError, ValueError):
                 rate = 0.0
             amount = round(hours * rate, 2)
+        month_total_hours = round(month_total_hours + hours, 2)
+        month_total_completed = round(month_total_completed + amount, 2)
         key = (str(user).strip(), task_name, str(category).strip())
         if not key[0]:
             continue
@@ -581,21 +625,15 @@ def _refresh_dashboard_tables_impl(
             project_start=project_start,
             activity_rows=activity,
             task_name=label,
-            as_of=week_start,
+            as_of=month_start,
         )
 
     # Build dashboard values as one contiguous block from row 1
     values: list[list] = [
-        ["Week Start", week_start],
-        ["Week Of", week_label],
-        [
-            "Total Hours",
-            f"=IFERROR(SUMIF({ACTIVITY_TAB}!G:G,B1,{ACTIVITY_TAB}!C:C),0)",
-        ],
-        [
-            "Total Completed ($)",
-            f"=IFERROR(SUMIF({ACTIVITY_TAB}!G:G,B1,{ACTIVITY_TAB}!I:I),0)",
-        ],
+        ["Month Start", month_start],
+        ["Month Of", month_label],
+        ["Total Hours", month_total_hours],
+        ["Total Completed ($)", month_total_completed],
         ["Project Start Date", project_start],
         ["Project Estimated End Date", project_end],
         [""],
@@ -1631,6 +1669,40 @@ def get_category_bar_chart_id(spreadsheet_id: str, sheets=None) -> int | None:
         return None
 
 
+def update_dashboard_month(
+    spreadsheet_id: str,
+    month_start: datetime,
+    month_label: str,
+    sheets=None,
+    project_key: str = "",
+    *,
+    refresh: bool = False,
+) -> None:
+    """
+    Write Month Start / Month Of on the Dashboard.
+
+    refresh=False by default so Slack log paths can update the month cells
+    cheaply and call refresh_dashboard_tables once after ActivityLog writes.
+    """
+    sheets = sheets or get_sheets_service()
+    month_start_date = month_start.date().replace(day=1).isoformat()
+    sheets_quota.execute_with_retry(
+        sheets.spreadsheets()
+        .values()
+        .update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{DASHBOARD_TAB}!B1:B2",
+            valueInputOption="USER_ENTERED",
+            body={"values": [[month_start_date], [month_label]]},
+        ),
+        label="update_dashboard_month",
+    )
+    if refresh:
+        refresh_dashboard_tables(
+            sheets, spreadsheet_id, project_key=project_key, autosize=False
+        )
+
+
 def update_dashboard_week(
     spreadsheet_id: str,
     week_start: datetime,
@@ -1640,29 +1712,15 @@ def update_dashboard_week(
     *,
     refresh: bool = False,
 ) -> None:
-    """
-    Write Week Start / Week Of on the Dashboard.
-
-    refresh=False by default so Slack log paths can update the week cells
-    cheaply and call refresh_dashboard_tables once after ActivityLog writes.
-    """
-    sheets = sheets or get_sheets_service()
-    week_start_date = week_start.date().isoformat()
-    sheets_quota.execute_with_retry(
-        sheets.spreadsheets()
-        .values()
-        .update(
-            spreadsheetId=spreadsheet_id,
-            range=f"{DASHBOARD_TAB}!B1:B2",
-            valueInputOption="USER_ENTERED",
-            body={"values": [[week_start_date], [week_label]]},
-        ),
-        label="update_dashboard_week",
+    """Backward-compatible alias — dashboard rollups are month-scoped."""
+    update_dashboard_month(
+        spreadsheet_id,
+        week_start,
+        week_label,
+        sheets=sheets,
+        project_key=project_key,
+        refresh=refresh,
     )
-    if refresh:
-        refresh_dashboard_tables(
-            sheets, spreadsheet_id, project_key=project_key, autosize=False
-        )
 
 
 def append_log_entries(
@@ -1816,15 +1874,15 @@ def append_log_entries(
     return True
 
 
-def read_week_entries(
+def read_month_entries(
     spreadsheet_id: str,
-    week_start: datetime | None = None,
-    week_end: datetime | None = None,
+    month_start: datetime | None = None,
+    month_end: datetime | None = None,
     sheets=None,
 ) -> list[jm.LogEntry]:
     sheets = sheets or get_sheets_service()
-    if week_start is None or week_end is None:
-        week_start, week_end, _ = jm.get_current_week_range()
+    if month_start is None or month_end is None:
+        month_start, month_end, _ = jm.get_current_month_range()
 
     header_result = (
         sheets.spreadsheets()
@@ -1867,7 +1925,22 @@ def read_week_entries(
                 activity=str(activity).strip(),
             )
         )
-    return jm.filter_entries_for_week(entries, week_start, week_end)
+    return jm.filter_entries_for_month(entries, month_start, month_end)
+
+
+def read_week_entries(
+    spreadsheet_id: str,
+    week_start: datetime | None = None,
+    week_end: datetime | None = None,
+    sheets=None,
+) -> list[jm.LogEntry]:
+    """Backward-compatible alias — summary reads are month-scoped."""
+    return read_month_entries(
+        spreadsheet_id,
+        month_start=week_start,
+        month_end=week_end,
+        sheets=sheets,
+    )
 
 
 def _find_dashboard_section(

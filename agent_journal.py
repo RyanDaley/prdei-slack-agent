@@ -52,7 +52,8 @@ _LEGACY_CHART_PNG_PREFIX = "prdei-category-chart-"
 HEADING1_RGB = (69, 176, 225)  # #45B0E1
 HEADING1_FONT_PT = 14
 HEADING1_TITLES = (
-    "Weekly Summary",
+    "Monthly Summary",
+    "Weekly Summary",  # legacy docs
     "Hours Summary",
     "Hours by Task:",
     "Hours by Category:",  # legacy docs
@@ -282,12 +283,20 @@ def _find_marker_indices(body_content: list[dict], marker: str) -> Optional[tupl
     return None
 
 
-def _build_doc_header(project_name: str, week_label: str) -> str:
+def _find_summary_range(body_content: list[dict]) -> Optional[tuple[int, int]]:
+    for marker in (jm.SUMMARY_HEADING, jm.LEGACY_SUMMARY_HEADING):
+        found = _find_marker_indices(body_content, marker)
+        if found:
+            return found
+    return None
+
+
+def _build_doc_header(project_name: str, month_label: str) -> str:
     return (
         f"PROJECT: {project_name}\n"
-        f"WEEK OF: {week_label}\n\n"
+        f"MONTH OF: {month_label}\n\n"
         f"{jm.SUMMARY_HEADING}\n"
-        "(Accomplishments narrative will appear after your first entry this week.)\n\n"
+        "(Accomplishments narrative will appear after your first entry this month.)\n\n"
         f"{HOURS_START}\n"
         "(Hours summary syncs from the Google Sheet Dashboard after each log entry.)\n\n"
         f"{CHART_START}\n"
@@ -301,7 +310,7 @@ def _build_doc_header(project_name: str, week_label: str) -> str:
 def initialize_document_structure(
     document_id: str,
     project_name: str,
-    week_label: str,
+    month_label: str,
     service=None,
 ) -> bool:
     service = service or get_docs_service()
@@ -314,7 +323,10 @@ def initialize_document_structure(
 
     existing_text = read_document_text(document_id, service=service)
     has_core_markers = (
-        jm.SUMMARY_HEADING in existing_text
+        (
+            jm.SUMMARY_HEADING in existing_text
+            or jm.LEGACY_SUMMARY_HEADING in existing_text
+        )
         and HOURS_START in existing_text
         and ACTIVITY_START in existing_text
     )
@@ -329,7 +341,7 @@ def initialize_document_structure(
         return ok
 
     end_index = body_content[-1].get("endIndex", 1) - 1
-    replacement = _build_doc_header(project_name, week_label)
+    replacement = _build_doc_header(project_name, month_label)
     # Preserve prior document body under a legacy notice once.
     leftover = existing_text.strip()
     if leftover:
@@ -446,7 +458,7 @@ def replace_summary_section(
     document = get_document(service, document_id)
     body_content = _collect_body_elements(document)
 
-    summary_range = _find_marker_indices(body_content, jm.SUMMARY_HEADING)
+    summary_range = _find_summary_range(body_content)
     hours_range = _find_marker_indices(body_content, HOURS_START)
     if not summary_range or not hours_range:
         print("[JOURNAL ERROR] Could not locate summary/hours section markers.")
@@ -976,9 +988,9 @@ def sync_sheet_sections_into_doc(
     and re-embed the task budget progress chart below Hours by Task.
     """
     service = service or get_docs_service()
-    week_start, week_end, week_label = jm.get_current_week_range()
-    entries = agent_sheets.read_week_entries(
-        spreadsheet_id, week_start=week_start, week_end=week_end
+    month_start, month_end, month_label = jm.get_current_month_range()
+    entries = agent_sheets.read_month_entries(
+        spreadsheet_id, month_start=month_start, month_end=month_end
     )
     total_hours, _hours_by_category = agent_sheets.get_dashboard_totals(spreadsheet_id)
     task_rows = agent_sheets.get_dashboard_task_rows(spreadsheet_id)
@@ -992,19 +1004,19 @@ def sync_sheet_sections_into_doc(
     }
 
     hours_lines = [
-        f"Week of: {week_label}",
+        f"Month of: {month_label}",
         f"Total Hours: {total_hours:g}",
         "",
         "Hours by Task:",
     ]
     if hours_by_task or estimates or completed_by_task or task_rows:
-        # Prefer Dashboard task order; include any tasks logged this week.
+        # Prefer Dashboard task order; include any tasks logged this month.
         labels = [r[0] for r in task_rows] if task_rows else list(hours_by_task.keys())
         for name in hours_by_task:
             if name not in labels:
                 labels.append(name)
         if not labels:
-            hours_lines.append("(none this week)")
+            hours_lines.append("(none this month)")
         else:
             for task_name in labels:
                 if task_name == "(no tasks yet)":
@@ -1024,7 +1036,7 @@ def sync_sheet_sections_into_doc(
                     )
                 hours_lines.append("")
     else:
-        hours_lines.append("(none this week)")
+        hours_lines.append("(none this month)")
 
     activity_lines = ["Timestamp | User | Hours | Task | Category | Activity"]
     for entry in entries:
@@ -1033,7 +1045,7 @@ def sync_sheet_sections_into_doc(
             f"{entry.task_label or '-'} | {entry.category_label} | {entry.activity}"
         )
     if len(activity_lines) == 1:
-        activity_lines.append("(no entries this week)")
+        activity_lines.append("(no entries this month)")
 
     hours_ok = replace_section_body(
         document_id,
@@ -1073,10 +1085,10 @@ def _get_genai_client():
     return genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
 
 
-def compile_weekly_summary(
+def compile_monthly_summary(
     entries: list[jm.LogEntry],
     project_name: str,
-    week_label: str,
+    month_label: str,
     total_hours: float | None = None,
     hours_by_category: dict[str, float] | None = None,
     hours_by_task: dict[str, float] | None = None,
@@ -1095,7 +1107,7 @@ def compile_weekly_summary(
 
     system_instruction = """
 You are an expert technical writer for an architecture and engineering firm.
-Compile weekly project journal summaries for client review.
+Compile monthly project journal summaries for client review.
 
 Rules:
 1. Use a formal, objective, technical tone.
@@ -1107,7 +1119,7 @@ Rules:
 
     user_prompt = f"""
 Project: {project_name}
-Week: {week_label}
+Month: {month_label}
 Total hours (verified): {total_hours}
 Hours by task (verified): {json.dumps(hours_by_task)}
 Hours by category (verified): {json.dumps(hours_by_category)}
@@ -1132,12 +1144,12 @@ Return JSON with exactly these fields:
         )
         compiled = json.loads(response.text.strip())
     except Exception as exc:
-        print(f"  [AI ERROR] Gemini weekly compilation failed: {exc}")
+        print(f"  [AI ERROR] Gemini monthly compilation failed: {exc}")
         print("  [AI FALLBACK] Using Python-generated summary instead.")
         compiled = jm.build_fallback_summary(entries)
 
     narrative = (compiled or {}).get("accomplishments_narrative") or (
-        "Work was logged this week. See the detailed activity log in Google Sheets "
+        "Work was logged this month. See the detailed activity log in Google Sheets "
         "(and the synced table below)."
     )
     return {
@@ -1145,6 +1157,25 @@ Return JSON with exactly these fields:
         "hours_by_category": hours_by_category,
         "accomplishments_narrative": narrative,
     }
+
+
+def compile_weekly_summary(
+    entries: list[jm.LogEntry],
+    project_name: str,
+    week_label: str,
+    total_hours: float | None = None,
+    hours_by_category: dict[str, float] | None = None,
+    hours_by_task: dict[str, float] | None = None,
+) -> Optional[dict]:
+    """Backward-compatible alias — summaries are month-scoped."""
+    return compile_monthly_summary(
+        entries,
+        project_name,
+        week_label,
+        total_hours=total_hours,
+        hours_by_category=hours_by_category,
+        hours_by_task=hours_by_task,
+    )
 
 
 def render_doc_narrative(accomplishments_narrative: str) -> str:
@@ -1164,29 +1195,29 @@ def _update_summary_from_sheet(
     service,
     project_key: str = "",
 ) -> bool:
-    week_start, week_end, week_label = jm.get_current_week_range()
-    # Week cells only — ActivityLog append already refreshed Dashboard tables.
-    agent_sheets.update_dashboard_week(
-        spreadsheet_id, week_start, week_label, project_key=project_key, refresh=False
+    month_start, month_end, month_label = jm.get_current_month_range()
+    # Month cells only — ActivityLog append already refreshed Dashboard tables.
+    agent_sheets.update_dashboard_month(
+        spreadsheet_id, month_start, month_label, project_key=project_key, refresh=False
     )
 
-    week_entries = agent_sheets.read_week_entries(
-        spreadsheet_id, week_start=week_start, week_end=week_end
+    month_entries = agent_sheets.read_month_entries(
+        spreadsheet_id, month_start=month_start, month_end=month_end
     )
-    if not week_entries:
-        print("  [JOURNAL WARNING] No Sheet entries found for current week.")
+    if not month_entries:
+        print("  [JOURNAL WARNING] No Sheet entries found for current month.")
         return False
 
     total_hours, _hours_by_category = agent_sheets.get_dashboard_totals(spreadsheet_id)
     if not total_hours:
-        total_hours = round(sum(entry.hours for entry in week_entries), 2)
-    hours_by_task = jm.compute_hours_by_task(week_entries)
-    hours_by_category = jm.compute_hours_by_category(week_entries)
+        total_hours = round(sum(entry.hours for entry in month_entries), 2)
+    hours_by_task = jm.compute_hours_by_task(month_entries)
+    hours_by_category = jm.compute_hours_by_category(month_entries)
 
-    compiled = compile_weekly_summary(
-        week_entries,
+    compiled = compile_monthly_summary(
+        month_entries,
         project_name,
-        week_label,
+        month_label,
         total_hours=total_hours,
         hours_by_category=hours_by_category,
         hours_by_task=hours_by_task,
@@ -1206,7 +1237,7 @@ def _update_summary_from_sheet(
     )
 
 
-def refresh_weekly_summary(
+def refresh_monthly_summary(
     document_id: str,
     project_name: str,
     project_key: str = "",
@@ -1217,8 +1248,8 @@ def refresh_weekly_summary(
 
     try:
         service = get_docs_service()
-        _, _, week_label = jm.get_current_week_range()
-        initialize_document_structure(document_id, project_name, week_label, service=service)
+        _, _, month_label = jm.get_current_month_range()
+        initialize_document_structure(document_id, project_name, month_label, service=service)
 
         if not spreadsheet_id and project_key:
             assets = project_router.ensure_project_assets(project_key)
@@ -1248,11 +1279,26 @@ def refresh_weekly_summary(
             summary_updated=summary_updated,
             docs_refreshed=summary_updated,
             spreadsheet_id=spreadsheet_id,
-            error_message="" if summary_updated else "Could not refresh weekly summary.",
+            error_message="" if summary_updated else "Could not refresh monthly summary.",
         )
     except Exception as exc:
         print(f"  [JOURNAL ERROR] Failed to refresh summary: {exc}")
         return JournalUpdateResult(success=False, error_message=str(exc))
+
+
+def refresh_weekly_summary(
+    document_id: str,
+    project_name: str,
+    project_key: str = "",
+    spreadsheet_id: str = "",
+) -> JournalUpdateResult:
+    """Backward-compatible alias — summaries are month-scoped."""
+    return refresh_monthly_summary(
+        document_id,
+        project_name,
+        project_key=project_key,
+        spreadsheet_id=spreadsheet_id,
+    )
 
 
 def sync_period_document(
@@ -1274,9 +1320,9 @@ def sync_period_document(
 
     try:
         service = get_docs_service()
-        _, _, week_label = jm.get_current_week_range()
+        _, _, month_label = jm.get_current_month_range()
         if not initialize_document_structure(
-            document_id, project_name, week_label, service=service
+            document_id, project_name, month_label, service=service
         ):
             return JournalUpdateResult(
                 success=False,
@@ -1304,7 +1350,7 @@ def sync_period_document(
             summary_updated=summary_updated,
             docs_refreshed=summary_updated,
             spreadsheet_id=spreadsheet_id,
-            error_message="" if summary_updated else "Could not refresh weekly summary.",
+            error_message="" if summary_updated else "Could not refresh monthly summary.",
         )
     except Exception as exc:
         print(f"  [JOURNAL ERROR] Doc/chart sync failed: {exc}", flush=True)
@@ -1364,7 +1410,7 @@ def process_journal_update(
     hours_logged = round(sum(entry.hours for entry in new_entries), 2)
 
     try:
-        week_start, _, week_label = jm.get_current_week_range()
+        month_start, _, month_label = jm.get_current_month_range()
 
         if not spreadsheet_id and project_key:
             assets = project_router.ensure_project_assets(project_key)
@@ -1395,8 +1441,8 @@ def process_journal_update(
         spreadsheet_id, seeded = agent_sheets.ensure_spreadsheet(
             project_name, spreadsheet_id, project_key=project_key
         )
-        agent_sheets.update_dashboard_week(
-            spreadsheet_id, week_start, week_label, project_key=project_key
+        agent_sheets.update_dashboard_month(
+            spreadsheet_id, month_start, month_label, project_key=project_key
         )
         if seeded:
             # Sheet was empty/new and already filled from Firestore time_logs
